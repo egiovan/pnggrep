@@ -5,6 +5,26 @@ use std::path::{Path, PathBuf};
 
 const PNG_MAGIC: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 
+/// Directories skipped by default during recursive search
+const DEFAULT_IGNORED_DIRS: &[&str] = &[
+    "venv",
+    ".venv",
+    "env",
+    ".env",
+    "__pycache__",
+    ".git",
+    ".hg",
+    ".svn",
+    "target",
+    "build",
+    "dist",
+    "node_modules",
+    ".tox",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".cache",
+];
+
 #[link(name = "z")]
 extern "C" {
     fn uncompress(
@@ -15,7 +35,6 @@ extern "C" {
     ) -> i32;
 }
 
-/// Decomprime dati zlib usando libz.so di sistema (Z_OK = 0, Z_BUF_ERROR = -5)
 fn decompress_zlib(compressed: &[u8]) -> Option<String> {
     let mut dest_len = compressed.len().max(1024) * 4;
     let mut dest = vec![0u8; dest_len];
@@ -35,7 +54,6 @@ fn decompress_zlib(compressed: &[u8]) -> Option<String> {
             dest.truncate(cur_len);
             return String::from_utf8(dest).ok();
         } else if ret == -5 {
-            // Buffer insufficiente: raddoppia e riprova
             dest_len *= 2;
             dest.resize(dest_len, 0);
         } else {
@@ -81,7 +99,7 @@ pub fn extract_png_metadata<R: Read + Seek>(reader: &mut R) -> std::io::Result<V
                     let val = String::from_utf8_lossy(&data[pos + 1..]).to_string();
                     entries.push(MetadataEntry { key, value: val });
                 }
-                reader.seek(SeekFrom::Current(4))?; // Skip CRC
+                reader.seek(SeekFrom::Current(4))?;
             }
 
             b"zTXt" => {
@@ -95,7 +113,7 @@ pub fn extract_png_metadata<R: Read + Seek>(reader: &mut R) -> std::io::Result<V
                         }
                     }
                 }
-                reader.seek(SeekFrom::Current(4))?; // Skip CRC
+                reader.seek(SeekFrom::Current(4))?;
             }
 
             b"iTXt" => {
@@ -123,7 +141,7 @@ pub fn extract_png_metadata<R: Read + Seek>(reader: &mut R) -> std::io::Result<V
                         }
                     }
                 }
-                reader.seek(SeekFrom::Current(4))?; // Skip CRC
+                reader.seek(SeekFrom::Current(4))?;
             }
 
             _ => {
@@ -158,12 +176,23 @@ fn search_file(path: &Path, pattern_lower: &str) {
     }
 }
 
+pub fn is_ignored_dir(dir_name: &str) -> bool {
+    let clean_name = dir_name.trim_end_matches('/');
+    DEFAULT_IGNORED_DIRS
+        .iter()
+        .any(|&ignored| ignored.eq_ignore_ascii_case(clean_name))
+}
 
 fn visit_dirs(dir: &Path, pattern_lower: &str) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if is_ignored_dir(dir_name) {
+                        continue;
+                    }
+                }
                 visit_dirs(&path, pattern_lower);
             } else if path.is_file() {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -175,6 +204,7 @@ fn visit_dirs(dir: &Path, pattern_lower: &str) {
         }
     }
 }
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -202,7 +232,7 @@ mod tests {
         chunk.extend_from_slice(&(data.len() as u32).to_be_bytes());
         chunk.extend_from_slice(chunk_type);
         chunk.extend_from_slice(data);
-        chunk.extend_from_slice(&[0, 0, 0, 0]); // Dummy CRC
+        chunk.extend_from_slice(&[0, 0, 0, 0]);
         chunk
     }
 
@@ -228,5 +258,20 @@ mod tests {
         let mut cursor = Cursor::new(dummy);
         let entries = extract_png_metadata(&mut cursor).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_ignored_directories() {
+        assert!(is_ignored_dir("venv"));
+        assert!(is_ignored_dir("venv/"));
+        assert!(is_ignored_dir(".venv"));
+        assert!(is_ignored_dir("VENV"));
+        assert!(is_ignored_dir("__pycache__"));
+        assert!(is_ignored_dir(".git"));
+        assert!(is_ignored_dir("target"));
+
+        assert!(!is_ignored_dir("plots"));
+        assert!(!is_ignored_dir("venv_backup"));
+        assert!(!is_ignored_dir("analysis_venv"));
     }
 }
