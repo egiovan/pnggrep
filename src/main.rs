@@ -317,13 +317,25 @@ fn main() {
                 if i + 1 < args.len() {
                     i += 1;
                     max_lines = args[i].parse().unwrap_or(3);
+                } else {
+                    eprintln!("Error: -n requires a number of lines.");
+                    std::process::exit(1);
                 }
             }
-            "--cat" => {
+            // Accetta sia -cat che --cat
+            "-cat" | "--cat" => {
                 if i + 1 < args.len() {
                     i += 1;
                     cat_key = Some(args[i].clone());
+                } else {
+                    eprintln!("Error: --cat requires a metadata key: pnggrep --cat <KEY> <FILE>");
+                    std::process::exit(1);
                 }
+            }
+            // Intercetta qualsiasi flag sconosciuto che inizia con '-'
+            opt if opt.starts_with('-') && opt != "-" => {
+                eprintln!("Error: Unknown option '{}'. Run 'pnggrep --help' for usage.", opt);
+                std::process::exit(1);
             }
             other => {
                 positional.push(other.to_string());
