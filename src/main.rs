@@ -61,11 +61,15 @@ fn decompress_zlib(compressed: &[u8]) -> Option<String> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataEntry {
     pub key: String,
     pub value: String,
 }
+
+// -----------------------------------------------------------------------------
+// Parser PNG
+// -----------------------------------------------------------------------------
 
 pub fn extract_png_metadata<R: Read + Seek>(reader: &mut R) -> std::io::Result<Vec<MetadataEntry>> {
     let mut magic = [0u8; 8];
@@ -152,13 +156,391 @@ pub fn extract_png_metadata<R: Read + Seek>(reader: &mut R) -> std::io::Result<V
     Ok(entries)
 }
 
+// -----------------------------------------------------------------------------
+// Parser SVG & Decodifica XML/JSON
+// -----------------------------------------------------------------------------
+
+fn xml_unescape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            let mut entity = String::new();
+            let mut closed = false;
+            while let Some(&next_c) = chars.peek() {
+                if next_c == ';' {
+                    chars.next();
+                    closed = true;
+                    break;
+                }
+                if next_c == '&' || next_c == ' ' || entity.len() > 10 {
+                    break;
+                }
+                entity.push(chars.next().unwrap());
+            }
+
+            if closed {
+                match entity.as_str() {
+                    "quot" => out.push('"'),
+                    "amp" => out.push('&'),
+                    "apos" => out.push('\''),
+                    "lt" => out.push('<'),
+                    "gt" => out.push('>'),
+                    s if s.starts_with("#x") || s.starts_with("#X") => {
+                        if let Ok(code) = u32::from_str_radix(&s[2..], 16) {
+                            if let Some(ch) = std::char::from_u32(code) {
+                                out.push(ch);
+                            }
+                        }
+                    }
+                    s if s.starts_with('#') => {
+                        if let Ok(code) = s[1..].parse::<u32>() {
+                            if let Some(ch) = std::char::from_u32(code) {
+                                out.push(ch);
+                            }
+                        }
+                    }
+                    _ => {
+                        out.push('&');
+                        out.push_str(&entity);
+                        out.push(';');
+                    }
+                }
+            } else {
+                out.push('&');
+                out.push_str(&entity);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+pub fn parse_json_object(input: &str) -> Option<Vec<(String, String)>> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return None;
+    }
+
+    let mut results = Vec::new();
+    let chars: Vec<char> = trimmed.chars().collect();
+    let n = chars.len();
+    let mut i = 1;
+
+    while i < n {
+        while i < n && (chars[i].is_whitespace() || chars[i] == ',') {
+            i += 1;
+        }
+        if i >= n || chars[i] == '}' {
+            break;
+        }
+
+        if chars[i] != '"' {
+            return None;
+        }
+        i += 1;
+        let mut key = String::new();
+        while i < n && chars[i] != '"' {
+            if chars[i] == '\\' && i + 1 < n {
+                i += 1;
+                match chars[i] {
+                    '"' => key.push('"'),
+                    '\\' => key.push('\\'),
+                    '/' => key.push('/'),
+                    'n' => key.push('\n'),
+                    'r' => key.push('\r'),
+                    't' => key.push('\t'),
+                    _ => key.push(chars[i]),
+                }
+            } else {
+                key.push(chars[i]);
+            }
+            i += 1;
+        }
+        if i >= n {
+            return None;
+        }
+        i += 1; // skip closing '"'
+
+        while i < n && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= n || chars[i] != ':' {
+            return None;
+        }
+        i += 1; // skip ':'
+        while i < n && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= n {
+            return None;
+        }
+
+        if chars[i] == '"' {
+            i += 1;
+            let mut val = String::new();
+            while i < n && chars[i] != '"' {
+                if chars[i] == '\\' && i + 1 < n {
+                    i += 1;
+                    match chars[i] {
+                        '"' => val.push('"'),
+                        '\\' => val.push('\\'),
+                        '/' => val.push('/'),
+                        'n' => val.push('\n'),
+                        'r' => val.push('\r'),
+                        't' => val.push('\t'),
+                        'u' if i + 4 < n => {
+                            let hex_str: String = chars[i + 1..=i + 4].iter().collect();
+                            if let Ok(code) = u32::from_str_radix(&hex_str, 16) {
+                                if let Some(ch) = std::char::from_u32(code) {
+                                    val.push(ch);
+                                }
+                            }
+                            i += 4;
+                        }
+                        _ => val.push(chars[i]),
+                    }
+                } else {
+                    val.push(chars[i]);
+                }
+                i += 1;
+            }
+            if i < n {
+                i += 1;
+            }
+            results.push((key, val));
+        } else if chars[i] == '{' {
+            let start_obj = i;
+            let mut depth = 0;
+            let mut in_str = false;
+            while i < n {
+                if chars[i] == '"' && (i == 0 || chars[i - 1] != '\\') {
+                    in_str = !in_str;
+                } else if !in_str {
+                    if chars[i] == '{' {
+                        depth += 1;
+                    } else if chars[i] == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                i += 1;
+            }
+            let obj_str: String = chars[start_obj..i].iter().collect();
+            if let Some(sub_entries) = parse_json_object(&obj_str) {
+                for (sub_k, sub_v) in sub_entries {
+                    results.push((format!("{}/{}", key, sub_k), sub_v));
+                }
+            }
+        } else {
+            let start_val = i;
+            while i < n && chars[i] != ',' && chars[i] != '}' && !chars[i].is_whitespace() {
+                i += 1;
+            }
+            let val_str: String = chars[start_val..i].iter().collect();
+            results.push((key, val_str));
+        }
+    }
+
+    Some(results)
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+    }
+}
+
+pub fn extract_svg_metadata<R: Read>(reader: &mut R) -> std::io::Result<Vec<MetadataEntry>> {
+    let mut content = String::new();
+    reader.read_to_string(&mut content)?;
+
+    let search_area = if let Some(start) = content.find("<metadata") {
+        if let Some(end) = content[start..].find("</metadata>") {
+            &content[start..start + end + 11]
+        } else {
+            &content[..]
+        }
+    } else {
+        &content[..]
+    };
+
+    let mut entries = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(tag_start) = search_area[cursor..].find('<') {
+        let abs_start = cursor + tag_start;
+        cursor = abs_start + 1;
+
+        if search_area[abs_start..].starts_with("<!--")
+            || search_area[abs_start..].starts_with("<?")
+            || search_area[abs_start..].starts_with("<!")
+            || search_area[abs_start..].starts_with("</")
+        {
+            continue;
+        }
+
+        let tag_open_end = match search_area[abs_start..].find('>') {
+            Some(pos) => abs_start + pos,
+            None => break,
+        };
+
+        if search_area[tag_open_end - 1..=tag_open_end].starts_with('/') {
+            cursor = tag_open_end + 1;
+            continue;
+        }
+
+        let tag_header = &search_area[abs_start + 1..tag_open_end];
+        let raw_tag_name = tag_header
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('/');
+
+        if raw_tag_name.is_empty() {
+            continue;
+        }
+
+        let closing_tag = format!("</{}>", raw_tag_name);
+        if let Some(close_pos) = search_area[tag_open_end + 1..].find(&closing_tag) {
+            let abs_close = tag_open_end + 1 + close_pos;
+            let inner_raw = &search_area[tag_open_end + 1..abs_close];
+
+            // Considera solo elementi foglia (senza ulteriori sotto-tag XML)
+            let has_child_tags = inner_raw.contains('<') && !inner_raw.contains("<![CDATA[");
+            if !has_child_tags {
+                let clean_name = raw_tag_name.split(':').last().unwrap_or(raw_tag_name);
+                let key_name = capitalize(clean_name);
+                let unescaped_text = xml_unescape(inner_raw.trim());
+
+                if unescaped_text.starts_with('{') && unescaped_text.ends_with('}') {
+                    if let Some(json_entries) = parse_json_object(&unescaped_text) {
+                        for (jk, jv) in json_entries {
+                            entries.push(MetadataEntry {
+                                key: format!("{}/{}", key_name, jk),
+                                value: jv,
+                            });
+                        }
+                    } else {
+                        entries.push(MetadataEntry {
+                            key: key_name,
+                            value: unescaped_text,
+                        });
+                    }
+                } else if !unescaped_text.is_empty() {
+                    entries.push(MetadataEntry {
+                        key: key_name,
+                        value: unescaped_text,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(entries)
+}
+
+pub fn extract_metadata(path: &Path) -> std::io::Result<Vec<MetadataEntry>> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+
+    match ext.as_str() {
+        "png" => extract_png_metadata(&mut reader),
+        "svg" => extract_svg_metadata(&mut reader),
+        _ => Ok(Vec::new()),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Risoluzione Intelligente Chiavi (--cat)
+// -----------------------------------------------------------------------------
+
+fn normalize_key(k: &str) -> String {
+    k.chars()
+        .filter(|c| *c != '_' && *c != '-' && *c != '/')
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+pub fn resolve_key<'a>(entries: &'a [MetadataEntry], query: &str) -> Result<&'a MetadataEntry, String> {
+    let norm_query = normalize_key(query);
+
+    // 1. Corrispondenza esatta percorso intero (case-insensitive)
+    if let Some(entry) = entries.iter().find(|e| e.key.eq_ignore_ascii_case(query)) {
+        return Ok(entry);
+    }
+
+    // 2. Corrispondenza esatta solo nome foglia (dopo '/')
+    let leaf_matches: Vec<&MetadataEntry> = entries
+        .iter()
+        .filter(|e| {
+            let leaf = e.key.rsplit('/').next().unwrap_or(&e.key);
+            leaf.eq_ignore_ascii_case(query)
+        })
+        .collect();
+
+    if leaf_matches.len() == 1 {
+        return Ok(leaf_matches[0]);
+    } else if leaf_matches.len() > 1 {
+        let keys: Vec<String> = leaf_matches.iter().map(|e| format!("  - {}", e.key)).collect();
+        return Err(format!(
+            "Ambiguous key '{}'. Matches multiple metadata entries:\n{}",
+            query,
+            keys.join("\n")
+        ));
+    }
+
+    // 3. Corrispondenza normalizzata (ignora maiuscole, minuscole, '-' e '_')
+    let norm_leaf_matches: Vec<&MetadataEntry> = entries
+        .iter()
+        .filter(|e| {
+            let leaf = e.key.rsplit('/').next().unwrap_or(&e.key);
+            normalize_key(leaf) == norm_query || normalize_key(&e.key) == norm_query
+        })
+        .collect();
+
+    if norm_leaf_matches.len() == 1 {
+        return Ok(norm_leaf_matches[0]);
+    } else if norm_leaf_matches.len() > 1 {
+        let keys: Vec<String> = norm_leaf_matches.iter().map(|e| format!("  - {}", e.key)).collect();
+        return Err(format!(
+            "Ambiguous key '{}'. Matches multiple metadata entries:\n{}",
+            query,
+            keys.join("\n")
+        ));
+    }
+
+    let available: Vec<String> = entries.iter().map(|e| format!("  - {}", e.key)).collect();
+    Err(format!(
+        "Key '{}' not found. Available keys:\n{}",
+        query,
+        available.join("\n")
+    ))
+}
+
+// -----------------------------------------------------------------------------
+// Azioni CLI e Scansione
+// -----------------------------------------------------------------------------
+
 pub fn is_ignored_dir(dir_name: &str) -> bool {
     let clean_name = dir_name.trim_end_matches('/');
     DEFAULT_IGNORED_DIRS
         .iter()
         .any(|&ignored| ignored.eq_ignore_ascii_case(clean_name))
 }
-
 
 #[derive(Clone, Debug)]
 enum RunMode {
@@ -167,13 +549,7 @@ enum RunMode {
 }
 
 fn search_file(path: &Path, pattern_lower: &str) {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-    let mut reader = BufReader::new(file);
-
-    if let Ok(entries) = extract_png_metadata(&mut reader) {
+    if let Ok(entries) = extract_metadata(path) {
         for entry in entries {
             if entry.value.to_lowercase().contains(pattern_lower)
                 || entry.key.to_lowercase().contains(pattern_lower)
@@ -190,13 +566,7 @@ fn search_file(path: &Path, pattern_lower: &str) {
 }
 
 fn list_file(path: &Path, max_lines: usize) {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-    let mut reader = BufReader::new(file);
-
-    if let Ok(entries) = extract_png_metadata(&mut reader) {
+    if let Ok(entries) = extract_metadata(path) {
         if entries.is_empty() {
             return;
         }
@@ -212,7 +582,11 @@ fn list_file(path: &Path, max_lines: usize) {
                 println!("  \x1b[36m{}\x1b[0m: {}", entry.key, lines[0]);
             } else {
                 println!("  \x1b[36m{}\x1b[0m:", entry.key);
-                let limit = if max_lines == 0 { lines.len() } else { max_lines.min(lines.len()) };
+                let limit = if max_lines == 0 {
+                    lines.len()
+                } else {
+                    max_lines.min(lines.len())
+                };
 
                 for line in &lines[..limit] {
                     println!("    \x1b[90m|\x1b[0m {}", line.trim_end());
@@ -229,28 +603,35 @@ fn list_file(path: &Path, max_lines: usize) {
 }
 
 fn cat_metadata(file_path: &Path, target_key: &str) {
-    let file = match File::open(file_path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Error opening {}: {}", file_path.display(), e);
+    let entries = match extract_metadata(file_path) {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("Error reading {}: {}", file_path.display(), err);
             std::process::exit(1);
         }
     };
-    let mut reader = BufReader::new(file);
 
-    if let Ok(entries) = extract_png_metadata(&mut reader) {
-        for entry in entries {
-            if entry.key.eq_ignore_ascii_case(target_key) {
-                print!("{}", entry.value);
-                if !entry.value.ends_with('\n') {
-                    println!();
-                }
-                return;
+    if entries.is_empty() {
+        eprintln!("No metadata found in {}", file_path.display());
+        std::process::exit(1);
+    }
+
+    match resolve_key(&entries, target_key) {
+        Ok(entry) => {
+            print!("{}", entry.value);
+            if !entry.value.ends_with('\n') {
+                println!();
             }
         }
+        Err(err_msg) => {
+            eprintln!("Error in {}: {}", file_path.display(), err_msg);
+            std::process::exit(1);
+        }
     }
-    eprintln!("Key '{}' not found in {}", target_key, file_path.display());
-    std::process::exit(1);
+}
+
+fn is_supported_ext(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case("png") || ext.eq_ignore_ascii_case("svg")
 }
 
 fn visit_dirs(dir: &Path, mode: &RunMode) {
@@ -266,7 +647,7 @@ fn visit_dirs(dir: &Path, mode: &RunMode) {
                 visit_dirs(&path, mode);
             } else if path.is_file() {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if ext.eq_ignore_ascii_case("png") {
+                    if is_supported_ext(ext) {
                         match mode {
                             RunMode::Search { pattern } => search_file(&path, pattern),
                             RunMode::List { max_lines } => list_file(&path, *max_lines),
@@ -279,15 +660,15 @@ fn visit_dirs(dir: &Path, mode: &RunMode) {
 }
 
 fn print_help() {
-    println!("pnggrep - Search and list embedded PNG metadata\n");
+    println!("pnggrep - Search and list embedded PNG and SVG metadata\n");
     println!("USAGE:");
-    println!("    pnggrep <PATTERN> [PATH]            Search for pattern inside metadata");
+    println!("    pnggrep <PATTERN> [PATH]            Search pattern in PNG/SVG metadata");
     println!("    pnggrep -l [-n LINES] [PATH]        List all metadata keys and values");
     println!("    pnggrep --cat <KEY> <FILE>          Print raw value of a metadata key\n");
     println!("OPTIONS:");
-    println!("    -l                  List metadata mode (no search pattern required)");
+    println!("    -l                  List metadata mode (no pattern required)");
     println!("    -n <LINES>          Max lines to show per key in list mode [default: 3, 0=all]");
-    println!("    --cat <KEY> <FILE>  Dump exact value without formatting (useful for scripts)");
+    println!("    --cat, -cat <KEY>   Dump exact value without formatting");
     println!("    -h, --help          Show help information");
 }
 
@@ -322,7 +703,6 @@ fn main() {
                     std::process::exit(1);
                 }
             }
-            // Accetta sia -cat che --cat
             "-cat" | "--cat" => {
                 if i + 1 < args.len() {
                     i += 1;
@@ -332,7 +712,6 @@ fn main() {
                     std::process::exit(1);
                 }
             }
-            // Intercetta qualsiasi flag sconosciuto che inizia con '-'
             opt if opt.starts_with('-') && opt != "-" => {
                 eprintln!("Error: Unknown option '{}'. Run 'pnggrep --help' for usage.", opt);
                 std::process::exit(1);
@@ -376,52 +755,88 @@ fn main() {
         } else {
             PathBuf::from(".")
         };
-        let mode = RunMode::Search { pattern };
+
         if target_dir.is_file() {
-            if let RunMode::Search { ref pattern } = mode {
-                search_file(&target_dir, pattern);
-            }
+            search_file(&target_dir, &pattern);
         } else {
+            let mode = RunMode::Search { pattern };
             visit_dirs(&target_dir, &mode);
         }
     }
 }
+
+// -----------------------------------------------------------------------------
+// Test Unitari
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
 
-    fn create_chunk(chunk_type: &[u8; 4], data: &[u8]) -> Vec<u8> {
-        let mut chunk = Vec::new();
-        chunk.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        chunk.extend_from_slice(chunk_type);
-        chunk.extend_from_slice(data);
-        chunk.extend_from_slice(&[0, 0, 0, 0]);
-        chunk
+    #[test]
+    fn test_svg_metadata_with_json_in_description() {
+        let svg_data = r#"<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+  <metadata>
+    <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/">
+      <dc:title>equilibrio.svg</dc:title>
+      <dc:date>2026-09-10T10:00:00</dc:date>
+      <dc:description>{
+        &quot;directory&quot;: &quot;/home/plasma/sim&quot;,
+        &quot;filename&quot;: &quot;run.py&quot;,
+        &quot;source_code&quot;: &quot;import numpy as np\ndef solve(): pass\n&quot;,
+        &quot;git_commit&quot;: &quot;abcdef1&quot;
+      }</dc:description>
+    </rdf:RDF>
+  </metadata>
+  <rect width="100" height="100" />
+</svg>"#;
+
+        let mut cursor = Cursor::new(svg_data.as_bytes());
+        let entries = extract_svg_metadata(&mut cursor).unwrap();
+
+        assert_eq!(
+            resolve_key(&entries, "Title").unwrap().value,
+            "equilibrio.svg"
+        );
+
+        // Test 1: accesso con percorso completo
+        assert_eq!(
+            resolve_key(&entries, "Description/filename").unwrap().value,
+            "run.py"
+        );
+
+        // Test 2: leaf match esatto
+        assert_eq!(
+            resolve_key(&entries, "source_code").unwrap().value,
+            "import numpy as np\ndef solve(): pass\n"
+        );
+
+        // Test 3: normalizzazione automatica (SourceCode -> Description/source_code)
+        assert_eq!(
+            resolve_key(&entries, "SourceCode").unwrap().value,
+            "import numpy as np\ndef solve(): pass\n"
+        );
     }
 
     #[test]
-    fn test_extract_text_chunk() {
-        let mut png_bytes = PNG_MAGIC.to_vec();
-        let mut text_payload = b"Comment\0".to_vec();
-        text_payload.extend_from_slice(b"def compute():\n    x = 1\n    return x\n");
-        png_bytes.extend_from_slice(&create_chunk(b"tEXt", &text_payload));
-        png_bytes.extend_from_slice(&create_chunk(b"IEND", &[]));
+    fn test_resolve_key_ambiguity() {
+        let entries = vec![
+            MetadataEntry {
+                key: "SectionA/Status".to_string(),
+                value: "OK".to_string(),
+            },
+            MetadataEntry {
+                key: "SectionB/Status".to_string(),
+                value: "ERROR".to_string(),
+            },
+        ];
 
-        let mut cursor = Cursor::new(png_bytes);
-        let entries = extract_png_metadata(&mut cursor).unwrap();
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key, "Comment");
-        assert!(entries[0].value.contains("def compute():"));
-    }
-
-    #[test]
-    fn test_ignored_directories() {
-        assert!(is_ignored_dir("venv"));
-        assert!(is_ignored_dir(".venv"));
-        assert!(is_ignored_dir("__pycache__"));
-        assert!(!is_ignored_dir("figures"));
+        assert!(resolve_key(&entries, "Status").is_err());
+        assert_eq!(
+            resolve_key(&entries, "SectionA/Status").unwrap().value,
+            "OK"
+        );
     }
 }
