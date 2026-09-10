@@ -1,0 +1,13 @@
+[package]
+name = "pnggrep"
+version = "0.1.0"
+authors = ["Edmondo Giovannozzi <edmondo.giovannozzi@enea.it>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
