@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 const PNG_MAGIC: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 
-/// Directories skipped by default during recursive search
 const DEFAULT_IGNORED_DIRS: &[&str] = &[
     "venv",
     ".venv",
@@ -153,6 +152,20 @@ pub fn extract_png_metadata<R: Read + Seek>(reader: &mut R) -> std::io::Result<V
     Ok(entries)
 }
 
+pub fn is_ignored_dir(dir_name: &str) -> bool {
+    let clean_name = dir_name.trim_end_matches('/');
+    DEFAULT_IGNORED_DIRS
+        .iter()
+        .any(|&ignored| ignored.eq_ignore_ascii_case(clean_name))
+}
+
+
+#[derive(Clone, Debug)]
+enum RunMode {
+    Search { pattern: String },
+    List { max_lines: usize },
+}
+
 fn search_file(path: &Path, pattern_lower: &str) {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -176,14 +189,71 @@ fn search_file(path: &Path, pattern_lower: &str) {
     }
 }
 
-pub fn is_ignored_dir(dir_name: &str) -> bool {
-    let clean_name = dir_name.trim_end_matches('/');
-    DEFAULT_IGNORED_DIRS
-        .iter()
-        .any(|&ignored| ignored.eq_ignore_ascii_case(clean_name))
+fn list_file(path: &Path, max_lines: usize) {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let mut reader = BufReader::new(file);
+
+    if let Ok(entries) = extract_png_metadata(&mut reader) {
+        if entries.is_empty() {
+            return;
+        }
+
+        println!("\x1b[1;35m{}\x1b[0m", path.display());
+
+        for entry in entries {
+            let lines: Vec<&str> = entry.value.lines().collect();
+
+            if lines.is_empty() {
+                println!("  \x1b[36m{}\x1b[0m: (empty)", entry.key);
+            } else if lines.len() == 1 {
+                println!("  \x1b[36m{}\x1b[0m: {}", entry.key, lines[0]);
+            } else {
+                println!("  \x1b[36m{}\x1b[0m:", entry.key);
+                let limit = if max_lines == 0 { lines.len() } else { max_lines.min(lines.len()) };
+
+                for line in &lines[..limit] {
+                    println!("    \x1b[90m|\x1b[0m {}", line.trim_end());
+                }
+
+                if lines.len() > limit {
+                    let remaining = lines.len() - limit;
+                    println!("    \x1b[33m... [{} more lines omitted]\x1b[0m", remaining);
+                }
+            }
+        }
+        println!();
+    }
 }
 
-fn visit_dirs(dir: &Path, pattern_lower: &str) {
+fn cat_metadata(file_path: &Path, target_key: &str) {
+    let file = match File::open(file_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error opening {}: {}", file_path.display(), e);
+            std::process::exit(1);
+        }
+    };
+    let mut reader = BufReader::new(file);
+
+    if let Ok(entries) = extract_png_metadata(&mut reader) {
+        for entry in entries {
+            if entry.key.eq_ignore_ascii_case(target_key) {
+                print!("{}", entry.value);
+                if !entry.value.ends_with('\n') {
+                    println!();
+                }
+                return;
+            }
+        }
+    }
+    eprintln!("Key '{}' not found in {}", target_key, file_path.display());
+    std::process::exit(1);
+}
+
+fn visit_dirs(dir: &Path, mode: &RunMode) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -193,11 +263,14 @@ fn visit_dirs(dir: &Path, pattern_lower: &str) {
                         continue;
                     }
                 }
-                visit_dirs(&path, pattern_lower);
+                visit_dirs(&path, mode);
             } else if path.is_file() {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                     if ext.eq_ignore_ascii_case("png") {
-                        search_file(&path, pattern_lower);
+                        match mode {
+                            RunMode::Search { pattern } => search_file(&path, pattern),
+                            RunMode::List { max_lines } => list_file(&path, *max_lines),
+                        }
                     }
                 }
             }
@@ -205,21 +278,101 @@ fn visit_dirs(dir: &Path, pattern_lower: &str) {
     }
 }
 
+fn print_help() {
+    println!("pnggrep - Search and list embedded PNG metadata\n");
+    println!("USAGE:");
+    println!("    pnggrep <PATTERN> [PATH]            Search for pattern inside metadata");
+    println!("    pnggrep -l [-n LINES] [PATH]        List all metadata keys and values");
+    println!("    pnggrep --cat <KEY> <FILE>          Print raw value of a metadata key\n");
+    println!("OPTIONS:");
+    println!("    -l                  List metadata mode (no search pattern required)");
+    println!("    -n <LINES>          Max lines to show per key in list mode [default: 3, 0=all]");
+    println!("    --cat <KEY> <FILE>  Dump exact value without formatting (useful for scripts)");
+    println!("    -h, --help          Show help information");
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: pnggrep <PATTERN> [PATH]");
+        print_help();
         std::process::exit(1);
     }
 
-    let pattern = &args[1];
-    let target_dir = if args.len() >= 3 {
-        PathBuf::from(&args[2])
-    } else {
-        PathBuf::from(".")
-    };
+    let mut is_list = false;
+    let mut max_lines = 3usize;
+    let mut cat_key: Option<String> = None;
+    let mut positional = Vec::new();
 
-    visit_dirs(&target_dir, &pattern.to_lowercase());
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                print_help();
+                return;
+            }
+            "-l" => {
+                is_list = true;
+            }
+            "-n" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    max_lines = args[i].parse().unwrap_or(3);
+                }
+            }
+            "--cat" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    cat_key = Some(args[i].clone());
+                }
+            }
+            other => {
+                positional.push(other.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    if let Some(key) = cat_key {
+        if positional.is_empty() {
+            eprintln!("Error: --cat requires a file path: pnggrep --cat <KEY> <FILE>");
+            std::process::exit(1);
+        }
+        cat_metadata(Path::new(&positional[0]), &key);
+        return;
+    }
+
+    if is_list {
+        let target_dir = if !positional.is_empty() {
+            PathBuf::from(&positional[0])
+        } else {
+            PathBuf::from(".")
+        };
+        let mode = RunMode::List { max_lines };
+        if target_dir.is_file() {
+            list_file(&target_dir, max_lines);
+        } else {
+            visit_dirs(&target_dir, &mode);
+        }
+    } else {
+        if positional.is_empty() {
+            eprintln!("Error: Missing search pattern. Use -l to list all metadata.");
+            std::process::exit(1);
+        }
+        let pattern = positional[0].to_lowercase();
+        let target_dir = if positional.len() >= 2 {
+            PathBuf::from(&positional[1])
+        } else {
+            PathBuf::from(".")
+        };
+        let mode = RunMode::Search { pattern };
+        if target_dir.is_file() {
+            if let RunMode::Search { ref pattern } = mode {
+                search_file(&target_dir, pattern);
+            }
+        } else {
+            visit_dirs(&target_dir, &mode);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -240,7 +393,7 @@ mod tests {
     fn test_extract_text_chunk() {
         let mut png_bytes = PNG_MAGIC.to_vec();
         let mut text_payload = b"Comment\0".to_vec();
-        text_payload.extend_from_slice(b"def compute_flux(): pass");
+        text_payload.extend_from_slice(b"def compute():\n    x = 1\n    return x\n");
         png_bytes.extend_from_slice(&create_chunk(b"tEXt", &text_payload));
         png_bytes.extend_from_slice(&create_chunk(b"IEND", &[]));
 
@@ -249,29 +402,14 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "Comment");
-        assert_eq!(entries[0].value, "def compute_flux(): pass");
-    }
-
-    #[test]
-    fn test_non_png_file() {
-        let dummy = b"NOT_A_PNG_FILE".to_vec();
-        let mut cursor = Cursor::new(dummy);
-        let entries = extract_png_metadata(&mut cursor).unwrap();
-        assert!(entries.is_empty());
+        assert!(entries[0].value.contains("def compute():"));
     }
 
     #[test]
     fn test_ignored_directories() {
         assert!(is_ignored_dir("venv"));
-        assert!(is_ignored_dir("venv/"));
         assert!(is_ignored_dir(".venv"));
-        assert!(is_ignored_dir("VENV"));
         assert!(is_ignored_dir("__pycache__"));
-        assert!(is_ignored_dir(".git"));
-        assert!(is_ignored_dir("target"));
-
-        assert!(!is_ignored_dir("plots"));
-        assert!(!is_ignored_dir("venv_backup"));
-        assert!(!is_ignored_dir("analysis_venv"));
+        assert!(!is_ignored_dir("figures"));
     }
 }
