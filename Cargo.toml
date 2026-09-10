@@ -3,8 +3,14 @@ name = "pnggrep"
 version = "0.1.0"
 authors = ["Edmondo Giovannozzi <edmondo.giovannozzi@enea.it>"]
 edition = "2018"
+description = "Fast, zero-dependency CLI tool to search and inspect metadata in PNG and SVG figures"
+license = "MIT"
+readme = "README.md"
+keywords = ["png", "svg", "metadata", "cli", "hpc"]
+categories = ["command-line-utilities"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[dependencies]
+# Zero external crates: relies solely on std and system libz via FFI
 
 [profile.release]
 opt-level = 3
