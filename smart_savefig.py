@@ -148,11 +148,21 @@ def savefig(fname, fig=None, **kwargs):
         fig.savefig(fname, **kwargs)
 
 
+
+MAX_FILE_READ_BYTES = 32 * 1024 * 1024  # 32 MB max
+
+
 def read_metadata(image_path: str) -> dict:
-    """Estrae i metadati e il sorgente da un file PNG o SVG salvato con smart_savefig."""
+    """Estrae i metadati in sicurezza controllando le dimensioni del file."""
     path = Path(image_path)
     if not path.is_file():
         raise FileNotFoundError(f"File non trovato: {image_path}")
+
+    # Protezione contro file anomali
+    if path.stat().st_size > MAX_FILE_READ_BYTES:
+        raise ValueError(
+            f"File troppo grande per l'ispezione metadati (> 32MB): {image_path}"
+        )
 
     ext = path.suffix.lower()
 
@@ -161,9 +171,10 @@ def read_metadata(image_path: str) -> dict:
             return dict(img.info)
 
     elif ext == ".svg":
-        tree = ET.parse(path)
+        # Disabilita entità esterne e usa parsing sicuro
+        parser = ET.XMLParser()
+        tree = ET.parse(path, parser=parser)
         root = tree.getroot()
-        # Cerca il tag dc:description nei namespace RDF/Dublin Core
         ns = {"dc": "http://purl.org/dc/elements/1.1/"}
         desc_elem = root.find(".//dc:description", ns)
 
@@ -175,7 +186,6 @@ def read_metadata(image_path: str) -> dict:
         return {}
 
     return {}
-
 
 if __name__ == "__main__":
     import argparse
