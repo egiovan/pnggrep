@@ -134,10 +134,11 @@ OPTIONS:
 
 This project is licensed under the MIT License. See the [LICENSE](https://www.google.com/search?q=LICENSE) file for details.
 
-```
-
 ---
 
+## Acknowledgments
+
+This software was developed with the assistance of Google's Gemini AI for code implementation and test suite design, under human direction and verification.
 
 
 
