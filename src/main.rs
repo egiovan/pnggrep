@@ -10,14 +10,15 @@ use walker::{cat_metadata, list_file, search_file, visit_dirs, RunMode};
 fn print_help() {
     println!("pnggrep - Search and list embedded PNG and SVG metadata\n");
     println!("USAGE:");
-    println!("    pnggrep <PATTERN> [PATH]            Search pattern in PNG/SVG metadata");
+    println!("    pnggrep <PATTERN> [PATH] [OPTIONS]  Search pattern in PNG/SVG metadata");
     println!("    pnggrep -l [-n LINES] [PATH]        List all metadata keys and values");
     println!("    pnggrep --cat <KEY> <FILE>          Print raw value of a metadata key\n");
     println!("OPTIONS:");
-    println!("    -l                  List metadata mode (no pattern required)");
-    println!("    -n <LINES>          Max lines to show per key in list mode [default: 3, 0=all]");
-    println!("    --cat, -cat <KEY>   Dump exact value without formatting");
-    println!("    -h, --help          Show help information");
+    println!("    -l                          List metadata mode (no pattern required)");
+    println!("    -n <LINES>                  Max lines to show per key in list mode [default: 3, 0=all]");
+    println!("    -s, --skip, --exclude <DIR> Skip specific directory during traversal (repeatable)");
+    println!("    --cat, -cat <KEY>           Dump exact value without formatting");
+    println!("    -h, --help                  Show help information");
 }
 
 fn main() {
@@ -30,6 +31,7 @@ fn main() {
     let mut is_list = false;
     let mut max_lines = 3usize;
     let mut cat_key: Option<String> = None;
+    let mut custom_excludes = Vec::new();
     let mut positional = Vec::new();
 
     let mut i = 1;
@@ -48,6 +50,15 @@ fn main() {
                     max_lines = args[i].parse().unwrap_or(3);
                 } else {
                     eprintln!("Error: -n requires a number of lines.");
+                    std::process::exit(1);
+                }
+            }
+            "-s" | "--skip" | "--exclude" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    custom_excludes.push(args[i].clone());
+                } else {
+                    eprintln!("Error: {} requires a directory name or path.", args[i]);
                     std::process::exit(1);
                 }
             }
@@ -90,7 +101,7 @@ fn main() {
         if target_dir.is_file() {
             list_file(&target_dir, max_lines);
         } else {
-            visit_dirs(&target_dir, &mode);
+            visit_dirs(&target_dir, &mode, &custom_excludes);
         }
     } else {
         if positional.is_empty() {
@@ -108,7 +119,7 @@ fn main() {
             search_file(&target_dir, &pattern);
         } else {
             let mode = RunMode::Search { pattern };
-            visit_dirs(&target_dir, &mode);
+            visit_dirs(&target_dir, &mode, &custom_excludes);
         }
     }
 }

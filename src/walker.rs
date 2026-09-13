@@ -17,29 +17,6 @@ pub enum RunMode {
     List { max_lines: usize },
 }
 
-/// Inspects directory signatures to dynamically identify Python virtual environments
-/// (standard venv, virtualenv, Conda, Mamba, Pixi, Poetry, etc.) regardless of directory name.
-pub fn is_python_venv(path: &Path) -> bool {
-    // 1. Standard venv / virtualenv / poetry / uv signature
-    if path.join("pyvenv.cfg").is_file() {
-        return true;
-    }
-
-    // 2. Conda / Mamba / Pixi environment signature
-    if path.join("conda-meta").is_dir() {
-        return true;
-    }
-
-    // 3. Fallback for custom or legacy POSIX / Windows environments
-    if (path.join("bin").join("activate").is_file() && path.join("bin").join("python").is_file())
-        || path.join("Scripts").join("activate.bat").is_file()
-    {
-        return true;
-    }
-
-    false
-}
-
 pub fn sanitize_for_terminal(input: &str) -> String {
     let mut clean = String::with_capacity(input.len());
     let mut in_escape = false;
@@ -67,6 +44,34 @@ pub fn is_ignored_dir(dir_name: &str) -> bool {
     DEFAULT_IGNORED_DIRS
         .iter()
         .any(|&ignored| ignored.eq_ignore_ascii_case(clean_name))
+}
+
+pub fn is_user_excluded(path: &Path, dir_name: &str, custom_excludes: &[String]) -> bool {
+    for exc in custom_excludes {
+        let clean_exc = exc.trim_end_matches('/');
+        if dir_name.eq_ignore_ascii_case(clean_exc) {
+            return true;
+        }
+        if path == Path::new(clean_exc) || path.ends_with(clean_exc) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn is_python_venv(path: &Path) -> bool {
+    if path.join("pyvenv.cfg").is_file() {
+        return true;
+    }
+    if path.join("conda-meta").is_dir() {
+        return true;
+    }
+    if (path.join("bin").join("activate").is_file() && path.join("bin").join("python").is_file())
+        || path.join("Scripts").join("activate.bat").is_file()
+    {
+        return true;
+    }
+    false
 }
 
 pub fn is_supported_ext(ext: &str) -> bool {
@@ -177,19 +182,32 @@ pub fn cat_metadata(file_path: &Path, target_key: &str) {
     }
 }
 
-pub fn visit_dirs(dir: &Path, mode: &RunMode) {
+pub fn visit_dirs(dir: &Path, mode: &RunMode, custom_excludes: &[String]) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                // Static check: known blocklist names
                 if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                    // 1. Check user-defined exclusions
+                    if is_user_excluded(&path, dir_name, custom_excludes) {
+                        eprintln!(
+                            "\x1b[33m[info]\x1b[0m Skipping excluded directory: \x1b[90m{}\x1b[0m",
+                            path.display()
+                        );
+                        continue;
+                    }
+
+                    // 2. Check default ignored directories
                     if is_ignored_dir(dir_name) {
+                        eprintln!(
+                            "\x1b[33m[info]\x1b[0m Skipping default ignored directory: \x1b[90m{}\x1b[0m",
+                            path.display()
+                        );
                         continue;
                     }
                 }
 
-                // Dynamic check: inspect directory signature
+                // 3. Dynamic Python virtual environment check
                 if is_python_venv(&path) {
                     eprintln!(
                         "\x1b[33m[info]\x1b[0m Skipping virtual environment: \x1b[90m{}\x1b[0m",
@@ -198,7 +216,7 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode) {
                     continue;
                 }
 
-                visit_dirs(&path, mode);
+                visit_dirs(&path, mode, custom_excludes);
             } else if path.is_file() {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                     if is_supported_ext(ext) {
@@ -212,7 +230,6 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode) {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -242,26 +259,31 @@ mod tests {
         assert!(!is_ignored_dir("my_venv"));
         assert!(!is_ignored_dir("venv_output"));
     }
-    
+
+    #[test]
+    fn test_user_excluded_directory() {
+        let excludes = vec!["scratch_dir".to_string(), "archive/old_runs".to_string()];
+        assert!(is_user_excluded(Path::new("runs/scratch_dir"), "scratch_dir", &excludes));
+        assert!(is_user_excluded(Path::new("archive/old_runs"), "old_runs", &excludes));
+        assert!(!is_user_excluded(Path::new("runs/active_run"), "active_run", &excludes));
+    }
+
     #[test]
     fn test_dynamic_venv_detection() {
         let temp_base = std::env::temp_dir().join("pnggrep_venv_test");
         let _ = fs::remove_dir_all(&temp_base);
         fs::create_dir_all(&temp_base).unwrap();
 
-        // 1. Directory with arbitrary name containing pyvenv.cfg
-        let custom_venv = temp_base.join("arbitrary_env_name");
+        let custom_venv = temp_base.join("custom_env_folder");
         fs::create_dir_all(&custom_venv).unwrap();
         fs::File::create(custom_venv.join("pyvenv.cfg")).unwrap();
         assert!(is_python_venv(&custom_venv));
 
-        // 2. Directory with arbitrary name containing conda-meta/
-        let conda_env = temp_base.join("my_custom_conda");
+        let conda_env = temp_base.join("my_conda_env");
         fs::create_dir_all(conda_env.join("conda-meta")).unwrap();
         assert!(is_python_venv(&conda_env));
 
-        // 3. Regular folder without venv markers
-        let normal_dir = temp_base.join("normal_figures_dir");
+        let normal_dir = temp_base.join("regular_plot_folder");
         fs::create_dir_all(&normal_dir).unwrap();
         assert!(!is_python_venv(&normal_dir));
 
