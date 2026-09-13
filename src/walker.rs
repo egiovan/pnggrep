@@ -11,6 +11,11 @@ pub const DEFAULT_IGNORED_DIRS: &[&str] = &[
     ".mypy_cache", ".cache",
 ];
 
+/// Directories skipped silently without printing to stderr
+pub const SILENT_IGNORED_DIRS: &[&str] = &[
+    ".git", "__pycache__", ".hg", ".svn",
+];
+
 #[derive(Clone, Debug)]
 pub enum RunMode {
     Search { pattern: String },
@@ -37,6 +42,13 @@ pub fn sanitize_for_terminal(input: &str) -> String {
         }
     }
     clean
+}
+
+pub fn is_silent_ignored_dir(dir_name: &str) -> bool {
+    let clean_name = dir_name.trim_end_matches('/');
+    SILENT_IGNORED_DIRS
+        .iter()
+        .any(|&ignored| ignored.eq_ignore_ascii_case(clean_name))
 }
 
 pub fn is_ignored_dir(dir_name: &str) -> bool {
@@ -188,7 +200,7 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode, custom_excludes: &[String]) {
             let path = entry.path();
             if path.is_dir() {
                 if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                    // 1. Check user-defined exclusions
+                    // 1. User-defined exclusions (always notify)
                     if is_user_excluded(&path, dir_name, custom_excludes) {
                         eprintln!(
                             "\x1b[33m[info]\x1b[0m Skipping excluded directory: \x1b[90m{}\x1b[0m",
@@ -197,7 +209,12 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode, custom_excludes: &[String]) {
                         continue;
                     }
 
-                    // 2. Check default ignored directories
+                    // 2. Silent skips (internal VCS and bytecode caches)
+                    if is_silent_ignored_dir(dir_name) {
+                        continue;
+                    }
+
+                    // 3. Default ignored directories (notify)
                     if is_ignored_dir(dir_name) {
                         eprintln!(
                             "\x1b[33m[info]\x1b[0m Skipping default ignored directory: \x1b[90m{}\x1b[0m",
@@ -207,7 +224,7 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode, custom_excludes: &[String]) {
                     }
                 }
 
-                // 3. Dynamic Python virtual environment check
+                // 4. Dynamic Python virtual environment check (notify)
                 if is_python_venv(&path) {
                     eprintln!(
                         "\x1b[33m[info]\x1b[0m Skipping virtual environment: \x1b[90m{}\x1b[0m",
@@ -243,6 +260,19 @@ mod tests {
         assert!(!sanitized.contains('\x1b'));
         assert!(!sanitized.contains('\x07'));
         assert_eq!(sanitized, "MaliciousText\nLine 2\tTabbed");
+    }
+
+    #[test]
+    fn test_silent_ignored_directories() {
+        assert!(is_silent_ignored_dir(".git"));
+        assert!(is_silent_ignored_dir(".git/"));
+        assert!(is_silent_ignored_dir("__pycache__"));
+        assert!(is_silent_ignored_dir(".hg"));
+        assert!(is_silent_ignored_dir(".svn"));
+
+        assert!(!is_silent_ignored_dir("venv"));
+        assert!(!is_silent_ignored_dir("target"));
+        assert!(!is_silent_ignored_dir("build"));
     }
 
     #[test]

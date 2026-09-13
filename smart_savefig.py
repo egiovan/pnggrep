@@ -16,6 +16,21 @@ from PIL import Image
 
 MAX_FILE_READ_BYTES = 32 * 1024 * 1024  # 32 MB safety limit
 
+# Standard Dublin Core metadata elements accepted by Matplotlib's SVG backend
+PERMITTED_SVG_METADATA_KEYS = {
+    "creator", "date", "format", "identifier", "language", "relation",
+    "source", "subject", "title", "type", "coverage", "description",
+    "rights"
+}
+
+CANONICAL_SVG_KEYS = {
+    k.lower(): k for k in [
+        "Creator", "Date", "Format", "Identifier", "Language", "Relation",
+        "Source", "Subject", "Title", "Type", "Coverage", "Description",
+        "Rights"
+    ]
+}
+
 
 def _get_git_info(directory: str, script_name: str = None) -> dict:
     """
@@ -114,6 +129,8 @@ def _get_caller_context() -> dict:
 def savefig(fname, fig=None, **kwargs):
     """
     Save matplotlib figure with embedded directory, filename, and source code.
+    Any custom metadata keys not permitted by standard SVG specifications are
+    automatically embedded into the JSON payload within <dc:description>.
 
     Parameters:
         fname: Output filename or path (.png or .svg).
@@ -125,7 +142,7 @@ def savefig(fname, fig=None, **kwargs):
 
     ext = Path(fname).suffix.lower()
     ctx = _get_caller_context()
-    user_metadata = kwargs.pop("metadata", {}) or {}
+    user_metadata = dict(kwargs.pop("metadata", {}) or {})
 
     if ext == ".png":
         meta = {
@@ -143,19 +160,34 @@ def savefig(fname, fig=None, **kwargs):
             meta["GitDirty"] = str(ctx["git_dirty"])
             meta["GitScriptTracked"] = str(ctx.get("git_script_tracked", False))
 
-        meta.update(user_metadata)
+        # PNG tEXt/iTXt chunks accept arbitrary keys
+        meta.update({str(k): str(v) for k, v in user_metadata.items()})
         fig.savefig(fname, metadata=meta, **kwargs)
 
     elif ext == ".svg":
-        payload = json.dumps(ctx, indent=2, ensure_ascii=False)
-        meta = {
+        svg_meta = {
             "Title": ctx["filename"],
-            "Description": payload,
             "Date": ctx["timestamp"],
             "Type": "Scientific Visualization",
         }
-        meta.update(user_metadata)
-        fig.savefig(fname, metadata=meta, **kwargs)
+
+        # Separate permitted Dublin Core keys from custom entries
+        custom_json_metadata = {}
+        for key, val in user_metadata.items():
+            key_lower = str(key).strip().lower()
+            if key_lower in PERMITTED_SVG_METADATA_KEYS and key_lower != "description":
+                canonical_key = CANONICAL_SVG_KEYS[key_lower]
+                svg_meta[canonical_key] = str(val)
+            else:
+                # Custom keys and user description go into the JSON payload
+                custom_json_metadata[key] = val
+
+        ctx.update(custom_json_metadata)
+
+        payload = json.dumps(ctx, indent=2, ensure_ascii=False, default=str)
+        svg_meta["Description"] = payload
+
+        fig.savefig(fname, metadata=svg_meta, **kwargs)
 
     else:
         fig.savefig(fname, **kwargs)
@@ -181,14 +213,23 @@ def read_metadata(image_path: str) -> dict:
         tree = ET.parse(path, parser=parser)
         root = tree.getroot()
         ns = {"dc": "http://purl.org/dc/elements/1.1/"}
-        desc_elem = root.find(".//dc:description", ns)
 
+        metadata = {}
+        # Collect top-level Dublin Core fields
+        for elem in root.findall(".//dc:*", ns):
+            tag = elem.tag.split("}")[-1].capitalize()
+            if elem.text:
+                metadata[tag] = elem.text.strip()
+
+        # Unpack JSON payload if present
+        desc_elem = root.find(".//dc:description", ns)
         if desc_elem is not None and desc_elem.text:
             try:
-                return json.loads(desc_elem.text)
+                json_data = json.loads(desc_elem.text)
+                metadata.update(json_data)
             except json.JSONDecodeError:
-                return {"Description": desc_elem.text}
-        return {}
+                metadata["Description"] = desc_elem.text
+        return metadata
 
     return {}
 
