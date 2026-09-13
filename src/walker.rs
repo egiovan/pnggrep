@@ -17,6 +17,29 @@ pub enum RunMode {
     List { max_lines: usize },
 }
 
+/// Inspects directory signatures to dynamically identify Python virtual environments
+/// (standard venv, virtualenv, Conda, Mamba, Pixi, Poetry, etc.) regardless of directory name.
+pub fn is_python_venv(path: &Path) -> bool {
+    // 1. Standard venv / virtualenv / poetry / uv signature
+    if path.join("pyvenv.cfg").is_file() {
+        return true;
+    }
+
+    // 2. Conda / Mamba / Pixi environment signature
+    if path.join("conda-meta").is_dir() {
+        return true;
+    }
+
+    // 3. Fallback for custom or legacy POSIX / Windows environments
+    if (path.join("bin").join("activate").is_file() && path.join("bin").join("python").is_file())
+        || path.join("Scripts").join("activate.bat").is_file()
+    {
+        return true;
+    }
+
+    false
+}
+
 pub fn sanitize_for_terminal(input: &str) -> String {
     let mut clean = String::with_capacity(input.len());
     let mut in_escape = false;
@@ -159,11 +182,22 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                // Static check: known blocklist names
                 if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
                     if is_ignored_dir(dir_name) {
                         continue;
                     }
                 }
+
+                // Dynamic check: inspect directory signature
+                if is_python_venv(&path) {
+                    eprintln!(
+                        "\x1b[33m[info]\x1b[0m Skipping virtual environment: \x1b[90m{}\x1b[0m",
+                        path.display()
+                    );
+                    continue;
+                }
+
                 visit_dirs(&path, mode);
             } else if path.is_file() {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -178,6 +212,7 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode) {
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -206,5 +241,30 @@ mod tests {
         assert!(!is_ignored_dir("figures"));
         assert!(!is_ignored_dir("my_venv"));
         assert!(!is_ignored_dir("venv_output"));
+    }
+    
+    #[test]
+    fn test_dynamic_venv_detection() {
+        let temp_base = std::env::temp_dir().join("pnggrep_venv_test");
+        let _ = fs::remove_dir_all(&temp_base);
+        fs::create_dir_all(&temp_base).unwrap();
+
+        // 1. Directory with arbitrary name containing pyvenv.cfg
+        let custom_venv = temp_base.join("arbitrary_env_name");
+        fs::create_dir_all(&custom_venv).unwrap();
+        fs::File::create(custom_venv.join("pyvenv.cfg")).unwrap();
+        assert!(is_python_venv(&custom_venv));
+
+        // 2. Directory with arbitrary name containing conda-meta/
+        let conda_env = temp_base.join("my_custom_conda");
+        fs::create_dir_all(conda_env.join("conda-meta")).unwrap();
+        assert!(is_python_venv(&conda_env));
+
+        // 3. Regular folder without venv markers
+        let normal_dir = temp_base.join("normal_figures_dir");
+        fs::create_dir_all(&normal_dir).unwrap();
+        assert!(!is_python_venv(&normal_dir));
+
+        let _ = fs::remove_dir_all(&temp_base);
     }
 }
