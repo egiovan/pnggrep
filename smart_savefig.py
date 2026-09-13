@@ -1,12 +1,6 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Created on Wed Sep  9 15:08:09 2026
-
-@author: egio
-
-smart_savefig.py - Salva figure matplotlib incorporando nei metadati
-il file, la directory e il listato sorgente completo del modulo chiamante.
+smart_savefig.py - Save matplotlib figures embedding caller source code,
+file paths, execution context, and Git metadata into image metadata.
 """
 
 from datetime import datetime
@@ -20,9 +14,15 @@ import xml.etree.ElementTree as ET
 import matplotlib.pyplot as plt
 from PIL import Image
 
+MAX_FILE_READ_BYTES = 32 * 1024 * 1024  # 32 MB safety limit
 
-def _get_git_info(directory: str) -> dict:
-    """Recupera commit e stato del repository Git se presente."""
+
+def _get_git_info(directory: str, script_name: str = None) -> dict:
+    """
+    Retrieve Git commit and repository state:
+    - dirty is True if tracked files are modified or if the script is untracked.
+    - ignores unrelated untracked files in the working directory.
+    """
     try:
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
@@ -30,22 +30,39 @@ def _get_git_info(directory: str) -> dict:
             stderr=subprocess.DEVNULL,
             text=True,
         ).strip()
-        dirty = (
-            subprocess.check_output(
-                ["git", "status", "--porcelain"],
+
+        # Check only tracked files (-uno = --untracked-files=no)
+        tracked_changes = subprocess.check_output(
+            ["git", "status", "--porcelain", "-uno"],
+            cwd=directory,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+
+        # Verify that the calling script is tracked under version control
+        is_script_tracked = False
+        if script_name:
+            res = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", script_name],
                 cwd=directory,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                text=True,
-            ).strip()
-            != ""
-        )
-        return {"git_commit": commit, "git_dirty": dirty}
+            )
+            is_script_tracked = res.returncode == 0
+
+        dirty = bool(tracked_changes) or not is_script_tracked
+
+        return {
+            "git_commit": commit,
+            "git_dirty": dirty,
+            "git_script_tracked": is_script_tracked,
+        }
     except Exception:
         return {}
 
 
 def _get_caller_context() -> dict:
-    """Risale lo stack frame per individuare il modulo chiamante."""
+    """Walk up the call stack to identify the calling module."""
     frame = inspect.currentframe()
     this_file = os.path.abspath(__file__)
 
@@ -75,10 +92,9 @@ def _get_caller_context() -> dict:
         try:
             source_code = caller_path.read_text(encoding="utf-8")
         except Exception as e:
-            source_code = f"<Errore lettura sorgente: {e}>"
+            source_code = f"<Error reading source file: {e}>"
     else:
-        # Sessione interattiva o eval
-        source_code = f"<Non eseguito da file su disco: {caller_path}>"
+        source_code = f"<Not executed from a disk file: {caller_path}>"
 
     info = {
         "directory": caller_dir,
@@ -90,18 +106,19 @@ def _get_caller_context() -> dict:
         "timestamp": datetime.now().isoformat(),
     }
 
-    info.update(_get_git_info(caller_dir))
+    script_name = caller_name if caller_path.is_file() else None
+    info.update(_get_git_info(caller_dir, script_name))
     return info
 
 
 def savefig(fname, fig=None, **kwargs):
     """
-    Salva la figura inserendo nei metadati directory, nome file e sorgente del chiamante.
+    Save matplotlib figure with embedded directory, filename, and source code.
 
-    Parametri:
-        fname: percorso o nome file (.png o .svg).
-        fig: oggetto matplotlib.figure.Figure (default: plt.gcf()).
-        **kwargs: argomenti passati a matplotlib.pyplot.savefig.
+    Parameters:
+        fname: Output filename or path (.png or .svg).
+        fig: matplotlib.figure.Figure instance (defaults to plt.gcf()).
+        **kwargs: Extra arguments passed to matplotlib.pyplot.savefig.
     """
     if fig is None:
         fig = plt.gcf()
@@ -111,7 +128,6 @@ def savefig(fname, fig=None, **kwargs):
     user_metadata = kwargs.pop("metadata", {}) or {}
 
     if ext == ".png":
-        # Pillow e Matplotlib supportano chiavi arbitrarie nei chunk testuali tEXt/zTXt
         meta = {
             "SourceDirectory": ctx["directory"],
             "SourceFile": ctx["filename"],
@@ -119,20 +135,18 @@ def savefig(fname, fig=None, **kwargs):
             "CallerFunction": ctx["caller_function"],
             "Timestamp": ctx["timestamp"],
             "SourceCode": ctx["source_code"],
-            # Comment è standard e leggibile da quasi tutti i visualizzatori/exiftool
             "Comment": ctx["source_code"],
-            "Description": f"Generato da {ctx['filename']} ({ctx['caller_function']})",
+            "Description": f"Generated by {ctx['filename']} ({ctx['caller_function']})",
         }
         if "git_commit" in ctx:
             meta["GitCommit"] = ctx["git_commit"]
             meta["GitDirty"] = str(ctx["git_dirty"])
+            meta["GitScriptTracked"] = str(ctx.get("git_script_tracked", False))
 
         meta.update(user_metadata)
         fig.savefig(fname, metadata=meta, **kwargs)
 
     elif ext == ".svg":
-        # Matplotlib supporta in RDF: Creator, Date, Format, Type, Description, Title
-        # Serializziamo il contesto completo in JSON dentro 'Description'
         payload = json.dumps(ctx, indent=2, ensure_ascii=False)
         meta = {
             "Title": ctx["filename"],
@@ -144,25 +158,17 @@ def savefig(fname, fig=None, **kwargs):
         fig.savefig(fname, metadata=meta, **kwargs)
 
     else:
-        # Fallback per altri formati (es. PDF)
         fig.savefig(fname, **kwargs)
 
 
-
-MAX_FILE_READ_BYTES = 32 * 1024 * 1024  # 32 MB max
-
-
 def read_metadata(image_path: str) -> dict:
-    """Estrae i metadati in sicurezza controllando le dimensioni del file."""
+    """Extract metadata and source code from a PNG or SVG file."""
     path = Path(image_path)
     if not path.is_file():
-        raise FileNotFoundError(f"File non trovato: {image_path}")
+        raise FileNotFoundError(f"File not found: {image_path}")
 
-    # Protezione contro file anomali
     if path.stat().st_size > MAX_FILE_READ_BYTES:
-        raise ValueError(
-            f"File troppo grande per l'ispezione metadati (> 32MB): {image_path}"
-        )
+        raise ValueError(f"File too large for inspection (> 32MB): {image_path}")
 
     ext = path.suffix.lower()
 
@@ -171,7 +177,6 @@ def read_metadata(image_path: str) -> dict:
             return dict(img.info)
 
     elif ext == ".svg":
-        # Disabilita entità esterne e usa parsing sicuro
         parser = ET.XMLParser()
         tree = ET.parse(path, parser=parser)
         root = tree.getroot()
@@ -187,15 +192,16 @@ def read_metadata(image_path: str) -> dict:
 
     return {}
 
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Estrae il codice sorgente e i metadati da figure PNG/SVG."
+        description="Extract source code and metadata from PNG/SVG figures."
     )
-    parser.add_argument("image", help="Percorso dell'immagine PNG o SVG")
+    parser.add_argument("image", help="Path to PNG or SVG image")
     parser.add_argument(
-        "-o", "--output", help="Salva il codice estratto su un file .py"
+        "-o", "--output", help="Save extracted source code into a file"
     )
     args = parser.parse_args()
 
@@ -203,18 +209,15 @@ if __name__ == "__main__":
     source = meta.get("SourceCode") or meta.get("source_code") or meta.get("Comment")
 
     if not source:
-        print("Nessun codice sorgente trovato nei metadati.", file=sys.stderr)
+        print("No source code found in metadata.", file=sys.stderr)
         sys.exit(1)
 
     if args.output:
         Path(args.output).write_text(source, encoding="utf-8")
-        print(f"Sorgente estratto con successo in: {args.output}")
+        print(f"Source code successfully extracted to: {args.output}")
     else:
-        print(
-            f"# File di origine: {meta.get('SourceFile') or meta.get('filename')}"
-        )
-        print(
-            f"# Directory: {meta.get('SourceDirectory') or meta.get('directory')}"
-        )
+        print(f"# File: {meta.get('SourceFile') or meta.get('filename')}")
+        print(f"# Dir:  {meta.get('SourceDirectory') or meta.get('directory')}")
+        print(f"# Git:  {meta.get('GitCommit') or meta.get('git_commit')} (Dirty: {meta.get('GitDirty') or meta.get('git_dirty')})")
         print("-" * 60)
         print(source)

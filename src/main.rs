@@ -5,18 +5,17 @@ use std::path::{Path, PathBuf};
 
 const PNG_MAGIC: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 
-// Limiti di sicurezza contro DoS e Memory Exhaustion
-const MAX_METADATA_CHUNK_SIZE: u64 = 16 * 1024 * 1024;    // Max 16 MB per singolo chunk PNG
-const MAX_DECOMPRESSED_SIZE: usize = 32 * 1024 * 1024;    // Max 32 MB dopo decompressione zlib
-const MAX_SVG_READ_SIZE: u64 = 32 * 1024 * 1024;          // Max 32 MB analizzati per file SVG
-const MAX_JSON_RECURSION_DEPTH: usize = 8;                 // Max 8 livelli di annidamento JSON
+// Security limits against DoS and memory exhaustion attacks
+const MAX_METADATA_CHUNK_SIZE: u64 = 16 * 1024 * 1024;    // Max 16 MB per PNG chunk
+const MAX_DECOMPRESSED_SIZE: usize = 32 * 1024 * 1024;    // Max 32 MB uncompressed zlib payload
+const MAX_SVG_READ_SIZE: u64 = 32 * 1024 * 1024;          // Max 32 MB read per SVG file
+const MAX_JSON_RECURSION_DEPTH: usize = 8;                 // Max 8 levels of JSON nesting
 
 const DEFAULT_IGNORED_DIRS: &[&str] = &[
     "venv", ".venv", "env", ".env", "__pycache__", ".git", ".hg", ".svn",
     "target", "build", "dist", "node_modules", ".tox", ".pytest_cache",
     ".mypy_cache", ".cache",
 ];
-
 
 #[link(name = "z")]
 extern "C" {
@@ -62,9 +61,9 @@ fn decompress_zlib(compressed: &[u8]) -> Option<String> {
             dest.truncate(cur_len);
             return String::from_utf8(dest).ok();
         } else if ret == -5 {
-            // Buffer insufficiente: raddoppia se sotto la soglia di sicurezza
+            // Insufficient buffer: double up to safety limit
             if dest_len >= MAX_DECOMPRESSED_SIZE {
-                return None; // Possibile zlib bomb: interruzione di sicurezza
+                return None; // Possible compression bomb: abort
             }
             dest_len = dest_len.saturating_mul(2).min(MAX_DECOMPRESSED_SIZE);
             dest.resize(dest_len, 0);
@@ -74,7 +73,7 @@ fn decompress_zlib(compressed: &[u8]) -> Option<String> {
     }
 }
 
-/// Rimuove sequenze di escape ANSI e caratteri di controllo non stampabili
+/// Strips ANSI escape sequences and non-printable control characters for terminal safety
 fn sanitize_for_terminal(input: &str) -> String {
     let mut clean = String::with_capacity(input.len());
     let mut in_escape = false;
@@ -103,6 +102,10 @@ pub struct MetadataEntry {
     pub value: String,
 }
 
+// -----------------------------------------------------------------------------
+// PNG Parser
+// -----------------------------------------------------------------------------
+
 pub fn extract_png_metadata<R: Read + Seek>(reader: &mut R) -> std::io::Result<Vec<MetadataEntry>> {
     let mut magic = [0u8; 8];
     if reader.read_exact(&mut magic).is_err() || magic != PNG_MAGIC {
@@ -123,7 +126,7 @@ pub fn extract_png_metadata<R: Read + Seek>(reader: &mut R) -> std::io::Result<V
             break;
         }
 
-        // Controllo di sicurezza: ignora chunk con lunghezze anomale
+        // Safety check: ignore chunks with anomalous lengths
         if length > MAX_METADATA_CHUNK_SIZE {
             reader.seek(SeekFrom::Current(length as i64 + 4))?;
             continue;
@@ -193,6 +196,10 @@ pub fn extract_png_metadata<R: Read + Seek>(reader: &mut R) -> std::io::Result<V
 
     Ok(entries)
 }
+
+// -----------------------------------------------------------------------------
+// SVG Parser & XML/JSON Decoding
+// -----------------------------------------------------------------------------
 
 fn xml_unescape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -450,6 +457,7 @@ pub fn extract_svg_metadata<R: Read>(reader: &mut R) -> std::io::Result<Vec<Meta
             let abs_close = tag_open_end + 1 + close_pos;
             let inner_raw = &search_area[tag_open_end + 1..abs_close];
 
+            // Consider only leaf elements (no further nested XML tags)
             let has_child_tags = inner_raw.contains('<') && !inner_raw.contains("<![CDATA[");
             if !has_child_tags {
                 let clean_name = raw_tag_name.split(':').last().unwrap_or(raw_tag_name);
@@ -500,6 +508,10 @@ pub fn extract_metadata(path: &Path) -> std::io::Result<Vec<MetadataEntry>> {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Key Resolution (--cat)
+// -----------------------------------------------------------------------------
+
 fn normalize_key(k: &str) -> String {
     k.chars()
         .filter(|c| *c != '_' && *c != '-' && *c != '/')
@@ -510,10 +522,12 @@ fn normalize_key(k: &str) -> String {
 pub fn resolve_key<'a>(entries: &'a [MetadataEntry], query: &str) -> Result<&'a MetadataEntry, String> {
     let norm_query = normalize_key(query);
 
+    // 1. Exact full-path match (case-insensitive)
     if let Some(entry) = entries.iter().find(|e| e.key.eq_ignore_ascii_case(query)) {
         return Ok(entry);
     }
 
+    // 2. Exact leaf-name match (after '/')
     let leaf_matches: Vec<&MetadataEntry> = entries
         .iter()
         .filter(|e| {
@@ -533,6 +547,7 @@ pub fn resolve_key<'a>(entries: &'a [MetadataEntry], query: &str) -> Result<&'a 
         ));
     }
 
+    // 3. Normalized match (ignores case, '-', and '_')
     let norm_leaf_matches: Vec<&MetadataEntry> = entries
         .iter()
         .filter(|e| {
@@ -559,6 +574,10 @@ pub fn resolve_key<'a>(entries: &'a [MetadataEntry], query: &str) -> Result<&'a 
         available.join("\n")
     ))
 }
+
+// -----------------------------------------------------------------------------
+// CLI Actions & Directory Traversal
+// -----------------------------------------------------------------------------
 
 pub fn is_ignored_dir(dir_name: &str) -> bool {
     let clean_name = dir_name.trim_end_matches('/');
@@ -795,9 +814,8 @@ fn main() {
     }
 }
 
-
 // -----------------------------------------------------------------------------
-// Test Unitari
+// Unit Tests
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -805,17 +823,17 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    // Helper per creare chunk PNG sintetici validi: [length(4B)][type(4B)][data][CRC(4B)]
+    // Helper to build synthetic valid PNG chunks: [length(4B)][type(4B)][data][CRC(4B)]
     fn create_png_chunk(chunk_type: &[u8; 4], data: &[u8]) -> Vec<u8> {
         let mut chunk = Vec::new();
         chunk.extend_from_slice(&(data.len() as u32).to_be_bytes());
         chunk.extend_from_slice(chunk_type);
         chunk.extend_from_slice(data);
-        chunk.extend_from_slice(&[0, 0, 0, 0]); // Dummy CRC (skippato da seek)
+        chunk.extend_from_slice(&[0, 0, 0, 0]); // Dummy CRC (skipped via seek)
         chunk
     }
 
-    // Helper per comprimere con zlib nativo nei test
+    // Helper to compress bytes using system zlib during tests
     fn compress_data(data: &[u8]) -> Vec<u8> {
         let mut dest_len = data.len().saturating_add(64);
         let mut dest = vec![0u8; dest_len];
@@ -827,18 +845,18 @@ mod tests {
                 data.len(),
             )
         };
-        assert_eq!(ret, 0, "Compressione zlib fallita");
+        assert_eq!(ret, 0, "zlib compression failed");
         dest.truncate(dest_len);
         dest
     }
 
-    // --- Test PNG ---
+    // --- PNG Tests ---
 
     #[test]
     fn test_png_text_chunk() {
         let mut png = PNG_MAGIC.to_vec();
         let mut payload = b"Author\0".to_vec();
-        payload.extend_from_slice(b"Edmondo Giovannozzi");
+        payload.extend_from_slice(b"Scientific Researcher");
         png.extend_from_slice(&create_png_chunk(b"tEXt", &payload));
         png.extend_from_slice(&create_png_chunk(b"IEND", &[]));
 
@@ -847,7 +865,7 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "Author");
-        assert_eq!(entries[0].value, "Edmondo Giovannozzi");
+        assert_eq!(entries[0].value, "Scientific Researcher");
     }
 
     #[test]
@@ -884,11 +902,10 @@ mod tests {
     #[test]
     fn test_png_oversized_chunk_protection() {
         let mut png = PNG_MAGIC.to_vec();
-        // Chunk fittizio con lunghezza dichiarata superiore a 16MB (32MB)
+        // Synthetic chunk with declared size larger than 16MB limit (32MB)
         let fake_len = 32 * 1024 * 1024u32;
         png.extend_from_slice(&fake_len.to_be_bytes());
         png.extend_from_slice(b"tEXt");
-        // Non alloca payload ma chiude subito: il parser deve skippare senza andare in OOM
         png.extend_from_slice(&create_png_chunk(b"IEND", &[]));
 
         let mut cursor = Cursor::new(png);
@@ -896,7 +913,7 @@ mod tests {
         assert!(entries.is_empty());
     }
 
-    // --- Test SVG & XML/JSON ---
+    // --- SVG & XML/JSON Tests ---
 
     #[test]
     fn test_svg_metadata_with_json_in_description() {
@@ -904,10 +921,10 @@ mod tests {
 <svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
   <metadata>
     <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/">
-      <dc:title>equilibrio.svg</dc:title>
+      <dc:title>equilibrium.svg</dc:title>
       <dc:date>2026-09-10T10:00:00</dc:date>
       <dc:description>{
-        &quot;directory&quot;: &quot;/home/plasma/sim&quot;,
+        &quot;directory&quot;: &quot;/home/researcher/sim&quot;,
         &quot;filename&quot;: &quot;run.py&quot;,
         &quot;source_code&quot;: &quot;import numpy as np\ndef solve(): pass\n&quot;,
         &quot;git_commit&quot;: &quot;abcdef1&quot;
@@ -920,13 +937,13 @@ mod tests {
         let mut cursor = Cursor::new(svg_data.as_bytes());
         let entries = extract_svg_metadata(&mut cursor).unwrap();
 
-        assert_eq!(resolve_key(&entries, "Title").unwrap().value, "equilibrio.svg");
+        assert_eq!(resolve_key(&entries, "Title").unwrap().value, "equilibrium.svg");
         assert_eq!(resolve_key(&entries, "Description/filename").unwrap().value, "run.py");
         assert_eq!(
             resolve_key(&entries, "source_code").unwrap().value,
             "import numpy as np\ndef solve(): pass\n"
         );
-        // Normalizzazione automatica: camelCase -> snake_case
+        // Automatic normalization: CamelCase -> snake_case
         assert_eq!(
             resolve_key(&entries, "SourceCode").unwrap().value,
             "import numpy as np\ndef solve(): pass\n"
@@ -950,14 +967,13 @@ mod tests {
 
     #[test]
     fn test_json_recursion_depth_limit() {
-        // Genera un JSON annidato oltre il limite MAX_JSON_RECURSION_DEPTH (8)
+        // Nested JSON exceeding MAX_JSON_RECURSION_DEPTH (8)
         let deep_json = "{\"a\":{\"b\":{\"c\":{\"d\":{\"e\":{\"f\":{\"g\":{\"h\":{\"i\":{\"j\":\"deep\"}}}}}}}}}}";
         let parsed = parse_json_object(deep_json, 0);
-        // Deve rifiutare l'albero per prevenire stack overflow
         assert!(parsed.is_none());
     }
 
-    // --- Test Risoluzione Chiavi (--cat) ---
+    // --- Key Resolution Tests (--cat) ---
 
     #[test]
     fn test_resolve_key_exact_and_leaf() {
@@ -972,11 +988,11 @@ mod tests {
             },
         ];
 
-        // Match su percorso completo
+        // Full path match
         assert_eq!(resolve_key(&entries, "Description/source_code").unwrap().value, "x = 42");
-        // Match solo sul nodo foglia
+        // Leaf match
         assert_eq!(resolve_key(&entries, "source_code").unwrap().value, "x = 42");
-        // Match normalizzato (ignora '-' o '_')
+        // Normalized match
         assert_eq!(resolve_key(&entries, "source-code").unwrap().value, "x = 42");
         assert_eq!(resolve_key(&entries, "SourceCode").unwrap().value, "x = 42");
     }
@@ -994,12 +1010,10 @@ mod tests {
             },
         ];
 
-        // Match ambiguo deve restituire errore
         let res = resolve_key(&entries, "Status");
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("Ambiguous key"));
 
-        // Specificando il percorso completo deve risolvere univocamente
         assert_eq!(resolve_key(&entries, "SectionA/Status").unwrap().value, "OK");
     }
 
@@ -1015,11 +1029,10 @@ mod tests {
         assert!(res.unwrap_err().contains("Available keys"));
     }
 
-    // --- Test Utility & Sicurezza Terminale ---
+    // --- Terminal & Safety Tests ---
 
     #[test]
     fn test_sanitize_terminal_escapes() {
-        // Escape ANSI colore rosso (\x1b[31m), reset (\x1b[0m) e carattere di controllo Bell (\x07)
         let malicious_str = "\x1b[31mMalicious\x1b[0m\x07Text\nLine 2\tTabbed";
         let sanitized = sanitize_for_terminal(malicious_str);
 
@@ -1043,6 +1056,3 @@ mod tests {
         assert!(!is_ignored_dir("venv_output"));
     }
 }
-
-
-
