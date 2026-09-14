@@ -1,6 +1,14 @@
 """
-smart_savefig.py - Save matplotlib figures embedding caller source code,
-file paths, execution context, and Git metadata into image metadata.
+smart_savefig.py - Reproducible Scientific Visualization Module
+
+Drop-in replacement for `matplotlib.pyplot.savefig`.
+Automatically embeds caller script source code, file system context,
+runtime timestamp, and Git revision status into image metadata
+for PNG, SVG, and PDF formats.
+
+Custom user-defined metadata keys are automatically routed to native
+fields when permitted by the underlying file format, or packed into
+a JSON payload when restricted by standard format schemas.
 """
 
 from datetime import datetime
@@ -8,37 +16,63 @@ import inspect
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+import matplotlib
 import matplotlib.pyplot as plt
 from PIL import Image
 
-MAX_FILE_READ_BYTES = 32 * 1024 * 1024  # 32 MB safety limit
+# Maximum memory allocation guard against oversized files during inspection
+MAX_FILE_READ_BYTES = 32 * 1024 * 1024  # 32 MB
 
 # Standard Dublin Core metadata elements accepted by Matplotlib's SVG backend
-PERMITTED_SVG_METADATA_KEYS = {
+PERMITTED_SVG_KEYS = {
     "creator", "date", "format", "identifier", "language", "relation",
     "source", "subject", "title", "type", "coverage", "description",
-    "rights"
+    "rights",
 }
 
 CANONICAL_SVG_KEYS = {
     k.lower(): k for k in [
         "Creator", "Date", "Format", "Identifier", "Language", "Relation",
         "Source", "Subject", "Title", "Type", "Coverage", "Description",
-        "Rights"
+        "Rights",
+    ]
+}
+
+# Standard PDF /Info dictionary keys accepted by Matplotlib's PDF backend
+PERMITTED_PDF_KEYS = {
+    "title", "author", "subject", "keywords", "creator", "producer",
+    "creationdate", "moddate", "trapped",
+}
+
+CANONICAL_PDF_KEYS = {
+    k.lower(): k for k in [
+        "Title", "Author", "Subject", "Keywords", "Creator", "Producer",
+        "CreationDate", "ModDate", "Trapped",
     ]
 }
 
 
 def _get_git_info(directory: str, script_name: str = None) -> dict:
     """
-    Retrieve Git commit and repository state:
-    - dirty is True if tracked files are modified or if the script is untracked.
-    - ignores unrelated untracked files in the working directory.
+    Query Git to determine the current repository revision and cleanliness.
+
+    Parameters:
+        directory: The working directory of the caller script.
+        script_name: The filename of the caller script to check for tracking.
+
+    Returns:
+        dict containing:
+            - 'git_commit': Full 40-character SHA1 hash of HEAD.
+            - 'git_dirty': Boolean, True if tracked files are modified or
+                           if the caller script itself is untracked.
+            - 'git_script_tracked': Boolean, True if script is committed/tracked.
     """
     try:
+        # 1. Retrieve the latest commit hash from HEAD
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
             cwd=directory,
@@ -46,7 +80,9 @@ def _get_git_info(directory: str, script_name: str = None) -> dict:
             text=True,
         ).strip()
 
-        # Check only tracked files (-uno = --untracked-files=no)
+        # 2. Check for modifications to tracked files only.
+        # The '-uno' (--untracked-files=no) flag prevents scratch or unignored
+        # files in the directory from falsely flagging the repository as dirty.
         tracked_changes = subprocess.check_output(
             ["git", "status", "--porcelain", "-uno"],
             cwd=directory,
@@ -54,7 +90,7 @@ def _get_git_info(directory: str, script_name: str = None) -> dict:
             text=True,
         ).strip()
 
-        # Verify that the calling script is tracked under version control
+        # 3. Verify that the calling Python script is under version control
         is_script_tracked = False
         if script_name:
             res = subprocess.run(
@@ -63,8 +99,10 @@ def _get_git_info(directory: str, script_name: str = None) -> dict:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            is_script_tracked = res.returncode == 0
+            is_script_tracked = (res.returncode == 0)
 
+        # The state is considered dirty if tracked files have uncommitted changes
+        # OR if the caller script itself has never been staged/committed.
         dirty = bool(tracked_changes) or not is_script_tracked
 
         return {
@@ -73,14 +111,19 @@ def _get_git_info(directory: str, script_name: str = None) -> dict:
             "git_script_tracked": is_script_tracked,
         }
     except Exception:
+        # Return empty dictionary if not in a Git repository or Git is not installed
         return {}
 
 
 def _get_caller_context() -> dict:
-    """Walk up the call stack to identify the calling module."""
+    """
+    Inspect the Python call stack to determine the original caller module,
+    extracting its file path, directory, calling function, and raw source code.
+    """
     frame = inspect.currentframe()
     this_file = os.path.abspath(__file__)
 
+    # Walk up the call stack until reaching a frame outside this file
     caller_frame = frame.f_back if frame else None
     while caller_frame:
         filename = caller_frame.f_code.co_filename
@@ -88,6 +131,7 @@ def _get_caller_context() -> dict:
             break
         caller_frame = caller_frame.f_back
 
+    # Fallback if executed in an interactive environment without a file stack
     if not caller_frame:
         return {
             "directory": os.getcwd(),
@@ -103,6 +147,7 @@ def _get_caller_context() -> dict:
     caller_dir = str(caller_path.parent)
     caller_name = caller_path.name
 
+    # Read the full source code directly from the disk file
     if caller_path.is_file():
         try:
             source_code = caller_path.read_text(encoding="utf-8")
@@ -121,6 +166,7 @@ def _get_caller_context() -> dict:
         "timestamp": datetime.now().isoformat(),
     }
 
+    # Query Git metadata using the caller's directory and filename
     script_name = caller_name if caller_path.is_file() else None
     info.update(_get_git_info(caller_dir, script_name))
     return info
@@ -128,14 +174,17 @@ def _get_caller_context() -> dict:
 
 def savefig(fname, fig=None, **kwargs):
     """
-    Save matplotlib figure with embedded directory, filename, and source code.
-    Any custom metadata keys not permitted by standard SVG specifications are
-    automatically embedded into the JSON payload within <dc:description>.
+    Save a Matplotlib figure embedding the caller's source code and Git metadata.
+
+    Supports PNG, SVG, and PDF formats:
+      - PNG: Metadata stored directly in tEXt/iTXt chunks.
+      - SVG: Dublin Core keys mapped natively; custom keys packed in Description JSON.
+      - PDF: Standard keys mapped to /Info dict; custom keys packed in Keywords JSON.
 
     Parameters:
-        fname: Output filename or path (.png or .svg).
+        fname: Output filename or path (.png, .svg, or .pdf).
         fig: matplotlib.figure.Figure instance (defaults to plt.gcf()).
-        **kwargs: Extra arguments passed to matplotlib.pyplot.savefig.
+        **kwargs: Extra keyword arguments forwarded to matplotlib.pyplot.savefig.
     """
     if fig is None:
         fig = plt.gcf()
@@ -144,6 +193,9 @@ def savefig(fname, fig=None, **kwargs):
     ctx = _get_caller_context()
     user_metadata = dict(kwargs.pop("metadata", {}) or {})
 
+    # -------------------------------------------------------------------------
+    # 1. PNG Backend
+    # -------------------------------------------------------------------------
     if ext == ".png":
         meta = {
             "SourceDirectory": ctx["directory"],
@@ -160,10 +212,13 @@ def savefig(fname, fig=None, **kwargs):
             meta["GitDirty"] = str(ctx["git_dirty"])
             meta["GitScriptTracked"] = str(ctx.get("git_script_tracked", False))
 
-        # PNG tEXt/iTXt chunks accept arbitrary keys
+        # PNG tEXt/iTXt chunks accept arbitrary key strings
         meta.update({str(k): str(v) for k, v in user_metadata.items()})
         fig.savefig(fname, metadata=meta, **kwargs)
 
+    # -------------------------------------------------------------------------
+    # 2. SVG Backend (Dublin Core validation)
+    # -------------------------------------------------------------------------
     elif ext == ".svg":
         svg_meta = {
             "Title": ctx["filename"],
@@ -171,30 +226,65 @@ def savefig(fname, fig=None, **kwargs):
             "Type": "Scientific Visualization",
         }
 
-        # Separate permitted Dublin Core keys from custom entries
+        # Separate permitted Dublin Core keys from custom research keys
         custom_json_metadata = {}
         for key, val in user_metadata.items():
             key_lower = str(key).strip().lower()
-            if key_lower in PERMITTED_SVG_METADATA_KEYS and key_lower != "description":
+            if key_lower in PERMITTED_SVG_KEYS and key_lower != "description":
                 canonical_key = CANONICAL_SVG_KEYS[key_lower]
                 svg_meta[canonical_key] = str(val)
             else:
-                # Custom keys and user description go into the JSON payload
                 custom_json_metadata[key] = val
 
+        # Pack caller context and all non-standard keys into the JSON payload
         ctx.update(custom_json_metadata)
-
         payload = json.dumps(ctx, indent=2, ensure_ascii=False, default=str)
         svg_meta["Description"] = payload
 
         fig.savefig(fname, metadata=svg_meta, **kwargs)
 
+    # -------------------------------------------------------------------------
+    # 3. PDF Backend (PDF /Info dictionary validation)
+    # -------------------------------------------------------------------------
+    elif ext == ".pdf":
+        # Separate permitted PDF keys (Title, Author, Subject, etc.) from custom keys
+        native_pdf_meta = {
+            "Title": str(user_metadata.get("Title", ctx["filename"])),
+            "Author": str(user_metadata.get("Author", ctx.get("caller_function", ""))),
+            "Subject": str(user_metadata.get("Subject", f"smart_savefig: {ctx['filename']}")),
+            "Creator": f"matplotlib {matplotlib.__version__} (smart_savefig)",
+        }
+
+        custom_json_metadata = {}
+        for key, val in user_metadata.items():
+            key_lower = str(key).strip().lower()
+            if key_lower in PERMITTED_PDF_KEYS and key_lower != "keywords":
+                canonical_key = CANONICAL_PDF_KEYS[key_lower]
+                native_pdf_meta[canonical_key] = str(val)
+            else:
+                custom_json_metadata[key] = val
+
+        # Merge caller context with custom keys into the Keywords JSON payload
+        ctx.update(custom_json_metadata)
+        payload = json.dumps(ctx, indent=2, ensure_ascii=False, default=str)
+        native_pdf_meta["Keywords"] = payload
+
+        fig.savefig(fname, metadata=native_pdf_meta, **kwargs)
+
+    # -------------------------------------------------------------------------
+    # 4. Other Backends (EPS, JPEG, etc.)
+    # -------------------------------------------------------------------------
     else:
         fig.savefig(fname, **kwargs)
 
 
 def read_metadata(image_path: str) -> dict:
-    """Extract metadata and source code from a PNG or SVG file."""
+    """
+    Extract metadata and embedded source code from a PNG, SVG, or PDF figure.
+
+    Returns:
+        dict containing all extracted metadata keys and unpacked JSON fields.
+    """
     path = Path(image_path)
     if not path.is_file():
         raise FileNotFoundError(f"File not found: {image_path}")
@@ -215,13 +305,11 @@ def read_metadata(image_path: str) -> dict:
         ns = {"dc": "http://purl.org/dc/elements/1.1/"}
 
         metadata = {}
-        # Collect top-level Dublin Core fields
         for elem in root.findall(".//dc:*", ns):
             tag = elem.tag.split("}")[-1].capitalize()
             if elem.text:
                 metadata[tag] = elem.text.strip()
 
-        # Unpack JSON payload if present
         desc_elem = root.find(".//dc:description", ns)
         if desc_elem is not None and desc_elem.text:
             try:
@@ -231,6 +319,33 @@ def read_metadata(image_path: str) -> dict:
                 metadata["Description"] = desc_elem.text
         return metadata
 
+    elif ext == ".pdf":
+        content = path.read_bytes()
+        lower_content = content.lower()
+        if b"matplotlib" not in lower_content and b"smart_savefig" not in lower_content:
+            return {}
+
+        match = re.search(rb'/Keywords\s*\((.*?)\)(?:\s*/|\s*>>)', content, re.DOTALL)
+        if match:
+            raw_val = match.group(1)
+            unescaped = (
+                raw_val.replace(b'\\(', b'(')
+                .replace(b'\\)', b')')
+                .replace(b'\\\\', b'\\')
+                .replace(b'\\n', b'\n')
+                .replace(b'\\r', b'\r')
+                .replace(b'\\t', b'\t')
+            )
+            try:
+                if unescaped.startswith(b'\xfe\xff'):
+                    text = unescaped[2:].decode('utf-16-be', errors='replace')
+                else:
+                    text = unescaped.decode('utf-8', errors='replace')
+                return json.loads(text)
+            except Exception:
+                pass
+        return {}
+
     return {}
 
 
@@ -238,12 +353,10 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Extract source code and metadata from PNG/SVG figures."
+        description="Extract source code and metadata from PNG, SVG, or PDF figures."
     )
-    parser.add_argument("image", help="Path to PNG or SVG image")
-    parser.add_argument(
-        "-o", "--output", help="Save extracted source code into a file"
-    )
+    parser.add_argument("image", help="Path to PNG, SVG, or PDF figure file")
+    parser.add_argument("-o", "--output", help="Save extracted source code to a file")
     args = parser.parse_args()
 
     meta = read_metadata(args.image)

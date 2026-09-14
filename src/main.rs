@@ -1,4 +1,5 @@
 mod model;
+mod pdf;
 mod png;
 mod svg;
 mod walker;
@@ -8,9 +9,9 @@ use std::path::{Path, PathBuf};
 use walker::{cat_metadata, list_file, search_file, visit_dirs, RunMode};
 
 fn print_help() {
-    println!("pnggrep - Search and list embedded PNG and SVG metadata\n");
+    println!("pnggrep - Search and list embedded PNG, SVG, and PDF metadata\n");
     println!("USAGE:");
-    println!("    pnggrep <PATTERN> [PATH] [OPTIONS]  Search pattern in PNG/SVG metadata");
+    println!("    pnggrep <PATTERN> [PATH] [OPTIONS]  Search pattern in PNG/SVG/PDF metadata");
     println!("    pnggrep -l [-n LINES] [PATH]        List all metadata keys and values");
     println!("    pnggrep --cat <KEY> <FILE>          Print raw value of a metadata key\n");
     println!("OPTIONS:");

@@ -1,9 +1,11 @@
 use crate::model::{resolve_key, MetadataEntry};
+use crate::pdf::extract_pdf_metadata;
 use crate::png::extract_png_metadata;
 use crate::svg::extract_svg_metadata;
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::Path;
+
 
 pub const DEFAULT_IGNORED_DIRS: &[&str] = &[
     "venv", ".venv", "env", ".env", "__pycache__", ".git", ".hg", ".svn",
@@ -87,7 +89,9 @@ pub fn is_python_venv(path: &Path) -> bool {
 }
 
 pub fn is_supported_ext(ext: &str) -> bool {
-    ext.eq_ignore_ascii_case("png") || ext.eq_ignore_ascii_case("svg")
+    ext.eq_ignore_ascii_case("png")
+        || ext.eq_ignore_ascii_case("svg")
+        || ext.eq_ignore_ascii_case("pdf")
 }
 
 pub fn extract_metadata(path: &Path) -> std::io::Result<Vec<MetadataEntry>> {
@@ -103,6 +107,7 @@ pub fn extract_metadata(path: &Path) -> std::io::Result<Vec<MetadataEntry>> {
     match ext.as_str() {
         "png" => extract_png_metadata(&mut reader),
         "svg" => extract_svg_metadata(&mut reader),
+        "pdf" => extract_pdf_metadata(&mut reader),
         _ => Ok(Vec::new()),
     }
 }
