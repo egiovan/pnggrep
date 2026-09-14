@@ -18,6 +18,7 @@ fn print_help() {
     println!("    -l                          List metadata mode (no pattern required)");
     println!("    -n <LINES>                  Max lines to show per key in list mode [default: 3, 0=all]");
     println!("    -k, --key <SUBSTRING>       Filter metadata keys matching substring (case-insensitive)");
+    println!("    -K, --keys-only             Show only matching metadata key names, omitting lines");
     println!("    -s, --skip, --exclude <DIR> Skip specific directory during traversal (repeatable)");
     println!("    --cat, -cat <KEY>           Dump exact value without formatting");
     println!("    -h, --help                  Show help information");
@@ -33,6 +34,7 @@ fn main() {
     let mut is_list = false;
     let mut max_lines = 3usize;
     let mut key_filter: Option<String> = None;
+    let mut keys_only = false;
     let mut cat_key: Option<String> = None;
     let mut custom_excludes = Vec::new();
     let mut positional = Vec::new();
@@ -64,6 +66,9 @@ fn main() {
                     eprintln!("Error: {} requires a key pattern.", args[i]);
                     std::process::exit(1);
                 }
+            }
+            "-K" | "--keys-only" => {
+                keys_only = true;
             }
             "-s" | "--skip" | "--exclude" => {
                 if i + 1 < args.len() {
@@ -131,11 +136,12 @@ fn main() {
         };
 
         if target_dir.is_file() {
-            search_file(&target_dir, &pattern, key_filter.as_deref());
+            search_file(&target_dir, &pattern, key_filter.as_deref(), keys_only);
         } else {
             let mode = RunMode::Search {
                 pattern,
                 key_filter,
+                keys_only,
             };
             visit_dirs(&target_dir, &mode, &custom_excludes);
         }

@@ -18,11 +18,13 @@ pub const SILENT_IGNORED_DIRS: &[&str] = &[
     ".git", "__pycache__", ".hg", ".svn",
 ];
 
+
 #[derive(Clone, Debug)]
 pub enum RunMode {
     Search {
         pattern: String,
         key_filter: Option<String>,
+        keys_only: bool,
     },
     List {
         max_lines: usize,
@@ -118,7 +120,8 @@ pub fn extract_metadata(path: &Path) -> std::io::Result<Vec<MetadataEntry>> {
     }
 }
 
-pub fn search_file(path: &Path, pattern_lower: &str, key_filter: Option<&str>) {
+
+pub fn search_file(path: &Path, pattern_lower: &str, key_filter: Option<&str>, keys_only: bool) {
     if let Ok(entries) = extract_metadata(path) {
         for entry in entries {
             // Apply key substring filter if requested
@@ -133,16 +136,20 @@ pub fn search_file(path: &Path, pattern_lower: &str, key_filter: Option<&str>) {
             {
                 let clean_key = sanitize_for_terminal(&entry.key);
                 println!("\x1b[35m{}\x1b[0m [\x1b[36m{}\x1b[0m]", path.display(), clean_key);
-                for (line_idx, line) in entry.value.lines().enumerate() {
-                    if line.to_lowercase().contains(pattern_lower) {
-                        let clean_line = sanitize_for_terminal(line.trim_end());
-                        println!("  \x1b[32m{:4}:\x1b[0m {}", line_idx + 1, clean_line);
+
+                if !keys_only {
+                    for (line_idx, line) in entry.value.lines().enumerate() {
+                        if line.to_lowercase().contains(pattern_lower) {
+                            let clean_line = sanitize_for_terminal(line.trim_end());
+                            println!("  \x1b[32m{:4}:\x1b[0m {}", line_idx + 1, clean_line);
+                        }
                     }
                 }
             }
         }
     }
 }
+
 
 pub fn list_file(path: &Path, max_lines: usize, key_filter: Option<&str>) {
     if let Ok(entries) = extract_metadata(path) {
@@ -268,8 +275,8 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode, custom_excludes: &[String]) {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                     if is_supported_ext(ext) {
                         match mode {
-                            RunMode::Search { pattern, key_filter } => {
-                                search_file(&path, pattern, key_filter.as_deref())
+                            RunMode::Search { pattern, key_filter, keys_only } => {
+                                search_file(&path, pattern, key_filter.as_deref(), *keys_only)
                             }
                             RunMode::List { max_lines, key_filter } => {
                                 list_file(&path, *max_lines, key_filter.as_deref())
