@@ -17,6 +17,7 @@ fn print_help() {
     println!("OPTIONS:");
     println!("    -l                          List metadata mode (no pattern required)");
     println!("    -n <LINES>                  Max lines to show per key in list mode [default: 3, 0=all]");
+    println!("    -k, --key <SUBSTRING>       Filter metadata keys matching substring (case-insensitive)");
     println!("    -s, --skip, --exclude <DIR> Skip specific directory during traversal (repeatable)");
     println!("    --cat, -cat <KEY>           Dump exact value without formatting");
     println!("    -h, --help                  Show help information");
@@ -31,6 +32,7 @@ fn main() {
 
     let mut is_list = false;
     let mut max_lines = 3usize;
+    let mut key_filter: Option<String> = None;
     let mut cat_key: Option<String> = None;
     let mut custom_excludes = Vec::new();
     let mut positional = Vec::new();
@@ -51,6 +53,15 @@ fn main() {
                     max_lines = args[i].parse().unwrap_or(3);
                 } else {
                     eprintln!("Error: -n requires a number of lines.");
+                    std::process::exit(1);
+                }
+            }
+            "-k" | "--key" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    key_filter = Some(args[i].to_lowercase());
+                } else {
+                    eprintln!("Error: {} requires a key pattern.", args[i]);
                     std::process::exit(1);
                 }
             }
@@ -98,9 +109,12 @@ fn main() {
         } else {
             PathBuf::from(".")
         };
-        let mode = RunMode::List { max_lines };
+        let mode = RunMode::List {
+            max_lines,
+            key_filter: key_filter.clone(),
+        };
         if target_dir.is_file() {
-            list_file(&target_dir, max_lines);
+            list_file(&target_dir, max_lines, key_filter.as_deref());
         } else {
             visit_dirs(&target_dir, &mode, &custom_excludes);
         }
@@ -117,9 +131,12 @@ fn main() {
         };
 
         if target_dir.is_file() {
-            search_file(&target_dir, &pattern);
+            search_file(&target_dir, &pattern, key_filter.as_deref());
         } else {
-            let mode = RunMode::Search { pattern };
+            let mode = RunMode::Search {
+                pattern,
+                key_filter,
+            };
             visit_dirs(&target_dir, &mode, &custom_excludes);
         }
     }

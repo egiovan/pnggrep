@@ -20,8 +20,14 @@ pub const SILENT_IGNORED_DIRS: &[&str] = &[
 
 #[derive(Clone, Debug)]
 pub enum RunMode {
-    Search { pattern: String },
-    List { max_lines: usize },
+    Search {
+        pattern: String,
+        key_filter: Option<String>,
+    },
+    List {
+        max_lines: usize,
+        key_filter: Option<String>,
+    },
 }
 
 pub fn sanitize_for_terminal(input: &str) -> String {
@@ -112,9 +118,16 @@ pub fn extract_metadata(path: &Path) -> std::io::Result<Vec<MetadataEntry>> {
     }
 }
 
-pub fn search_file(path: &Path, pattern_lower: &str) {
+pub fn search_file(path: &Path, pattern_lower: &str, key_filter: Option<&str>) {
     if let Ok(entries) = extract_metadata(path) {
         for entry in entries {
+            // Apply key substring filter if requested
+            if let Some(kf) = key_filter {
+                if !entry.key.to_lowercase().contains(kf) {
+                    continue;
+                }
+            }
+
             if entry.value.to_lowercase().contains(pattern_lower)
                 || entry.key.to_lowercase().contains(pattern_lower)
             {
@@ -131,15 +144,27 @@ pub fn search_file(path: &Path, pattern_lower: &str) {
     }
 }
 
-pub fn list_file(path: &Path, max_lines: usize) {
+pub fn list_file(path: &Path, max_lines: usize, key_filter: Option<&str>) {
     if let Ok(entries) = extract_metadata(path) {
-        if entries.is_empty() {
+        let filtered: Vec<MetadataEntry> = entries
+            .into_iter()
+            .filter(|e| {
+                if let Some(kf) = key_filter {
+                    e.key.to_lowercase().contains(kf)
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        // If no keys match the filter, do not display this file
+        if filtered.is_empty() {
             return;
         }
 
         println!("\x1b[1;35m{}\x1b[0m", path.display());
 
-        for entry in entries {
+        for entry in filtered {
             let clean_key = sanitize_for_terminal(&entry.key);
             let lines: Vec<&str> = entry.value.lines().collect();
 
@@ -243,8 +268,12 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode, custom_excludes: &[String]) {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                     if is_supported_ext(ext) {
                         match mode {
-                            RunMode::Search { pattern } => search_file(&path, pattern),
-                            RunMode::List { max_lines } => list_file(&path, *max_lines),
+                            RunMode::Search { pattern, key_filter } => {
+                                search_file(&path, pattern, key_filter.as_deref())
+                            }
+                            RunMode::List { max_lines, key_filter } => {
+                                list_file(&path, *max_lines, key_filter.as_deref())
+                            }
                         }
                     }
                 }
