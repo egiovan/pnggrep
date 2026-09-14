@@ -3,12 +3,10 @@ smart_savefig.py - Reproducible Scientific Visualization Module
 
 Drop-in replacement for `matplotlib.pyplot.savefig`.
 Automatically embeds caller script source code, file system context,
-runtime timestamp, and Git revision status into image metadata
+runtime timestamp, Git commit SHA, and Git commit message into image metadata
 for PNG, SVG, and PDF formats.
 
-Custom user-defined metadata keys are automatically routed to native
-fields when permitted by the underlying file format, or packed into
-a JSON payload when restricted by standard format schemas.
+Alerts the user on stderr if saving from a dirty or untracked repository state.
 """
 
 from datetime import datetime
@@ -58,21 +56,23 @@ CANONICAL_PDF_KEYS = {
 
 def _get_git_info(directory: str, script_name: str = None) -> dict:
     """
-    Query Git to determine the current repository revision and cleanliness.
+    Query Git to determine the commit hash, commit message, and repository status.
 
     Parameters:
         directory: The working directory of the caller script.
-        script_name: The filename of the caller script to check for tracking.
+        script_name: The filename of the caller script to verify tracking.
 
     Returns:
         dict containing:
-            - 'git_commit': Full 40-character SHA1 hash of HEAD.
+            - 'git_commit': Full 40-character commit SHA of HEAD.
+            - 'git_commit_message': Subject line of the latest commit.
             - 'git_dirty': Boolean, True if tracked files are modified or
                            if the caller script itself is untracked.
-            - 'git_script_tracked': Boolean, True if script is committed/tracked.
+            - 'git_script_tracked': Boolean, True if script is tracked.
+            - 'git_dirty_reason': Explanation of why the state is dirty.
     """
     try:
-        # 1. Retrieve the latest commit hash from HEAD
+        # 1. Retrieve the latest commit hash
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
             cwd=directory,
@@ -80,9 +80,15 @@ def _get_git_info(directory: str, script_name: str = None) -> dict:
             text=True,
         ).strip()
 
-        # 2. Check for modifications to tracked files only.
-        # The '-uno' (--untracked-files=no) flag prevents scratch or unignored
-        # files in the directory from falsely flagging the repository as dirty.
+        # 2. Retrieve the latest commit subject line
+        commit_msg = subprocess.check_output(
+            ["git", "log", "-1", "--format=%s"],
+            cwd=directory,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+
+        # 3. Check for uncommitted modifications to tracked files (-uno)
         tracked_changes = subprocess.check_output(
             ["git", "status", "--porcelain", "-uno"],
             cwd=directory,
@@ -90,7 +96,7 @@ def _get_git_info(directory: str, script_name: str = None) -> dict:
             text=True,
         ).strip()
 
-        # 3. Verify that the calling Python script is under version control
+        # 4. Verify that the calling Python script itself is tracked in Git
         is_script_tracked = False
         if script_name:
             res = subprocess.run(
@@ -101,29 +107,30 @@ def _get_git_info(directory: str, script_name: str = None) -> dict:
             )
             is_script_tracked = (res.returncode == 0)
 
-        # The state is considered dirty if tracked files have uncommitted changes
-        # OR if the caller script itself has never been staged/committed.
         dirty = bool(tracked_changes) or not is_script_tracked
+
+        dirty_reasons = []
+        if tracked_changes:
+            dirty_reasons.append("uncommitted changes in tracked files")
+        if not is_script_tracked:
+            dirty_reasons.append(f"script '{script_name}' is not tracked in Git")
 
         return {
             "git_commit": commit,
+            "git_commit_message": commit_msg,
             "git_dirty": dirty,
             "git_script_tracked": is_script_tracked,
+            "git_dirty_reason": "; ".join(dirty_reasons) if dirty else "clean",
         }
     except Exception:
-        # Return empty dictionary if not in a Git repository or Git is not installed
         return {}
 
 
 def _get_caller_context() -> dict:
-    """
-    Inspect the Python call stack to determine the original caller module,
-    extracting its file path, directory, calling function, and raw source code.
-    """
+    """Inspect the Python call stack to identify the caller script and location."""
     frame = inspect.currentframe()
     this_file = os.path.abspath(__file__)
 
-    # Walk up the call stack until reaching a frame outside this file
     caller_frame = frame.f_back if frame else None
     while caller_frame:
         filename = caller_frame.f_code.co_filename
@@ -131,7 +138,6 @@ def _get_caller_context() -> dict:
             break
         caller_frame = caller_frame.f_back
 
-    # Fallback if executed in an interactive environment without a file stack
     if not caller_frame:
         return {
             "directory": os.getcwd(),
@@ -147,7 +153,6 @@ def _get_caller_context() -> dict:
     caller_dir = str(caller_path.parent)
     caller_name = caller_path.name
 
-    # Read the full source code directly from the disk file
     if caller_path.is_file():
         try:
             source_code = caller_path.read_text(encoding="utf-8")
@@ -166,7 +171,6 @@ def _get_caller_context() -> dict:
         "timestamp": datetime.now().isoformat(),
     }
 
-    # Query Git metadata using the caller's directory and filename
     script_name = caller_name if caller_path.is_file() else None
     info.update(_get_git_info(caller_dir, script_name))
     return info
@@ -175,11 +179,7 @@ def _get_caller_context() -> dict:
 def savefig(fname, fig=None, **kwargs):
     """
     Save a Matplotlib figure embedding the caller's source code and Git metadata.
-
-    Supports PNG, SVG, and PDF formats:
-      - PNG: Metadata stored directly in tEXt/iTXt chunks.
-      - SVG: Dublin Core keys mapped natively; custom keys packed in Description JSON.
-      - PDF: Standard keys mapped to /Info dict; custom keys packed in Keywords JSON.
+    Prints an alert to stderr if the repository contains uncommitted changes.
 
     Parameters:
         fname: Output filename or path (.png, .svg, or .pdf).
@@ -192,6 +192,16 @@ def savefig(fname, fig=None, **kwargs):
     ext = Path(fname).suffix.lower()
     ctx = _get_caller_context()
     user_metadata = dict(kwargs.pop("metadata", {}) or {})
+
+    # Alert the user if the repository state is dirty
+    if ctx.get("git_dirty"):
+        reason = ctx.get("git_dirty_reason", "uncommitted changes detected")
+        sys.stderr.write(
+            f"\n\x1b[33m[smart_savefig ALERT]\x1b[0m Saving '\x1b[1m{fname}\x1b[0m' with a dirty Git state:\n"
+            f"  Reason: \x1b[31m{reason}\x1b[0m\n"
+            f"  Commit: {ctx.get('git_commit', 'unknown')[:8]} (\"{ctx.get('git_commit_message', '')}\")\n"
+            f"  \x1b[90m-> Consider committing your changes for strict reproducibility.\x1b[0m\n\n"
+        )
 
     # -------------------------------------------------------------------------
     # 1. PNG Backend
@@ -209,10 +219,10 @@ def savefig(fname, fig=None, **kwargs):
         }
         if "git_commit" in ctx:
             meta["GitCommit"] = ctx["git_commit"]
+            meta["GitCommitMessage"] = ctx.get("git_commit_message", "")
             meta["GitDirty"] = str(ctx["git_dirty"])
             meta["GitScriptTracked"] = str(ctx.get("git_script_tracked", False))
 
-        # PNG tEXt/iTXt chunks accept arbitrary key strings
         meta.update({str(k): str(v) for k, v in user_metadata.items()})
         fig.savefig(fname, metadata=meta, **kwargs)
 
@@ -226,7 +236,6 @@ def savefig(fname, fig=None, **kwargs):
             "Type": "Scientific Visualization",
         }
 
-        # Separate permitted Dublin Core keys from custom research keys
         custom_json_metadata = {}
         for key, val in user_metadata.items():
             key_lower = str(key).strip().lower()
@@ -236,7 +245,6 @@ def savefig(fname, fig=None, **kwargs):
             else:
                 custom_json_metadata[key] = val
 
-        # Pack caller context and all non-standard keys into the JSON payload
         ctx.update(custom_json_metadata)
         payload = json.dumps(ctx, indent=2, ensure_ascii=False, default=str)
         svg_meta["Description"] = payload
@@ -247,7 +255,6 @@ def savefig(fname, fig=None, **kwargs):
     # 3. PDF Backend (PDF /Info dictionary validation)
     # -------------------------------------------------------------------------
     elif ext == ".pdf":
-        # Separate permitted PDF keys (Title, Author, Subject, etc.) from custom keys
         native_pdf_meta = {
             "Title": str(user_metadata.get("Title", ctx["filename"])),
             "Author": str(user_metadata.get("Author", ctx.get("caller_function", ""))),
@@ -264,7 +271,6 @@ def savefig(fname, fig=None, **kwargs):
             else:
                 custom_json_metadata[key] = val
 
-        # Merge caller context with custom keys into the Keywords JSON payload
         ctx.update(custom_json_metadata)
         payload = json.dumps(ctx, indent=2, ensure_ascii=False, default=str)
         native_pdf_meta["Keywords"] = payload
@@ -272,19 +278,14 @@ def savefig(fname, fig=None, **kwargs):
         fig.savefig(fname, metadata=native_pdf_meta, **kwargs)
 
     # -------------------------------------------------------------------------
-    # 4. Other Backends (EPS, JPEG, etc.)
+    # 4. Other Backends
     # -------------------------------------------------------------------------
     else:
         fig.savefig(fname, **kwargs)
 
 
 def read_metadata(image_path: str) -> dict:
-    """
-    Extract metadata and embedded source code from a PNG, SVG, or PDF figure.
-
-    Returns:
-        dict containing all extracted metadata keys and unpacked JSON fields.
-    """
+    """Extract metadata and source code from a PNG, SVG, or PDF figure."""
     path = Path(image_path)
     if not path.is_file():
         raise FileNotFoundError(f"File not found: {image_path}")
@@ -370,8 +371,10 @@ if __name__ == "__main__":
         Path(args.output).write_text(source, encoding="utf-8")
         print(f"Source code successfully extracted to: {args.output}")
     else:
-        print(f"# File: {meta.get('SourceFile') or meta.get('filename')}")
-        print(f"# Dir:  {meta.get('SourceDirectory') or meta.get('directory')}")
-        print(f"# Git:  {meta.get('GitCommit') or meta.get('git_commit')} (Dirty: {meta.get('GitDirty') or meta.get('git_dirty')})")
+        print(f"# File:    {meta.get('SourceFile') or meta.get('filename')}")
+        print(f"# Dir:     {meta.get('SourceDirectory') or meta.get('directory')}")
+        print(f"# Commit:  {meta.get('GitCommit') or meta.get('git_commit')} (Dirty: {meta.get('GitDirty') or meta.get('git_dirty')})")
+        if meta.get("GitCommitMessage") or meta.get("git_commit_message"):
+            print(f"# Message: {meta.get('GitCommitMessage') or meta.get('git_commit_message')}")
         print("-" * 60)
         print(source)
