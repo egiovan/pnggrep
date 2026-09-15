@@ -1,24 +1,28 @@
 mod model;
 mod pdf;
 mod png;
+mod sanitize;
 mod svg;
 mod walker;
 
+use sanitize::sanitize_target;
 use std::env;
 use std::path::{Path, PathBuf};
 use walker::{cat_metadata, process_target, RunMode};
 
 fn print_help() {
-    println!("pnggrep - Search and list embedded PNG, SVG, and PDF metadata\n");
+    println!("pnggrep - Search, inspect, and sanitize embedded figure metadata\n");
     println!("USAGE:");
-    println!("    pnggrep <PATTERN> [PATHS...] [OPTIONS]  Search pattern in figures or directories");
-    println!("    pnggrep -l [-n LINES] [PATHS...]        List metadata across figures or directories");
-    println!("    pnggrep --cat <KEY> <FILE>              Print raw value of a metadata key\n");
+    println!("    pnggrep <PATTERN> [PATHS...] [OPTIONS]   Search pattern in figures or directories");
+    println!("    pnggrep -l [-n LINES] [PATHS...]         List metadata across figures or directories");
+    println!("    pnggrep --cat <KEY> <FILE>               Print raw value of a metadata key");
+    println!("    pnggrep --sanitize [PATHS...]            Strip metadata and write <file>_sanitized.<ext>\n");
     println!("OPTIONS:");
     println!("    -l                          List metadata mode (no pattern required)");
     println!("    -n <LINES>                  Max lines to show per key in list mode [default: 3, 0=all]");
     println!("    -k, --key <SUBSTRING>       Filter metadata keys matching substring (case-insensitive)");
     println!("    -K, --keys-only             Show only matching metadata key names, omitting lines");
+    println!("    --sanitize                  Strip sensitive metadata and create _sanitized files");
     println!("    -s, --skip, --exclude <DIR> Skip specific directory during traversal (repeatable)");
     println!("    --cat, -cat <KEY>           Dump exact value without formatting (1 file only)");
     println!("    -h, --help                  Show help information");
@@ -32,6 +36,7 @@ fn main() {
     }
 
     let mut is_list = false;
+    let mut is_sanitize = false;
     let mut max_lines = 3usize;
     let mut key_filter: Option<String> = None;
     let mut keys_only = false;
@@ -48,6 +53,9 @@ fn main() {
             }
             "-l" => {
                 is_list = true;
+            }
+            "--sanitize" => {
+                is_sanitize = true;
             }
             "-n" => {
                 if i + 1 < args.len() {
@@ -115,7 +123,23 @@ fn main() {
     }
 
     // -------------------------------------------------------------------------
-    // 2. -l (List) Mode (Multiple files/directories supported)
+    // 2. --sanitize Mode (Batch files/directories supported)
+    // -------------------------------------------------------------------------
+    if is_sanitize {
+        let targets: Vec<PathBuf> = if positional.is_empty() {
+            vec![PathBuf::from(".")]
+        } else {
+            positional.into_iter().map(PathBuf::from).collect()
+        };
+
+        for target in &targets {
+            sanitize_target(target, &custom_excludes);
+        }
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. -l (List) Mode (Multiple files/directories supported)
     // -------------------------------------------------------------------------
     if is_list {
         let targets: Vec<PathBuf> = if positional.is_empty() {
@@ -136,7 +160,7 @@ fn main() {
     }
 
     // -------------------------------------------------------------------------
-    // 3. Search Mode (Pattern + multiple files/directories supported)
+    // 4. Search Mode (Pattern + multiple files/directories supported)
     // -------------------------------------------------------------------------
     if positional.is_empty() {
         eprintln!("Error: Missing search pattern. Use -l to list all metadata.");

@@ -68,7 +68,7 @@ fn decode_hex_string(hex_bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Finds the end of a balanced dictionary `<< ... >>` skipping nested strings
-fn find_dict_end(slice: &[u8]) -> Option<usize> {
+pub fn find_dict_end(slice: &[u8]) -> Option<usize> {
     if !slice.starts_with(b"<<") {
         return None;
     }
@@ -120,7 +120,7 @@ fn find_dict_end(slice: &[u8]) -> Option<usize> {
 }
 
 /// Locates the Info dictionary either through trailer resolution or signature matching
-fn find_info_dict(content: &[u8]) -> Option<&[u8]> {
+pub fn find_info_dict(content: &[u8]) -> Option<&[u8]> {
     // Strategy 1: Search backwards for trailer /Info reference
     if let Some(trailer_pos) = content.windows(7).rposition(|w| w == b"trailer") {
         let trailer_slice = &content[trailer_pos..];
@@ -301,7 +301,7 @@ pub fn extract_pdf_metadata<R: Read>(reader: &mut R) -> std::io::Result<Vec<Meta
 
     for (key, val) in raw_entries {
         let trimmed_val = val.trim();
-        // Automatically unpack embedded JSON payload (e.g. from /Keywords)
+         // Automatically unpack embedded JSON payload (e.g. from /Keywords)
         if trimmed_val.starts_with('{') && trimmed_val.ends_with('}') {
             if let Some(json_entries) = parse_json_object(trimmed_val, 0) {
                 for (jk, jv) in json_entries {
