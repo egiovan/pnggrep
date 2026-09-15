@@ -289,6 +289,36 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode, custom_excludes: &[String]) {
     }
 }
 
+/// Dispatches a target path (file or directory) according to the active mode
+pub fn process_target(target: &Path, mode: &RunMode, custom_excludes: &[String]) {
+    if target.is_file() {
+        if let Some(ext) = target.extension().and_then(|e| e.to_str()) {
+            if is_supported_ext(ext) {
+                match mode {
+                    RunMode::Search { pattern, key_filter, keys_only } => {
+                        search_file(target, pattern, key_filter.as_deref(), *keys_only);
+                    }
+                    RunMode::List { max_lines, key_filter } => {
+                        list_file(target, *max_lines, key_filter.as_deref());
+                    }
+                }
+            } else {
+                eprintln!(
+                    "\x1b[33m[warning]\x1b[0m Unsupported image format: {}",
+                    target.display()
+                );
+            }
+        }
+    } else if target.is_dir() {
+        visit_dirs(target, mode, custom_excludes);
+    } else {
+        eprintln!(
+            "\x1b[31m[error]\x1b[0m Path not found: {}",
+            target.display()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

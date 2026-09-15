@@ -6,21 +6,21 @@ mod walker;
 
 use std::env;
 use std::path::{Path, PathBuf};
-use walker::{cat_metadata, list_file, search_file, visit_dirs, RunMode};
+use walker::{cat_metadata, process_target, RunMode};
 
 fn print_help() {
     println!("pnggrep - Search and list embedded PNG, SVG, and PDF metadata\n");
     println!("USAGE:");
-    println!("    pnggrep <PATTERN> [PATH] [OPTIONS]  Search pattern in PNG/SVG/PDF metadata");
-    println!("    pnggrep -l [-n LINES] [PATH]        List all metadata keys and values");
-    println!("    pnggrep --cat <KEY> <FILE>          Print raw value of a metadata key\n");
+    println!("    pnggrep <PATTERN> [PATHS...] [OPTIONS]  Search pattern in figures or directories");
+    println!("    pnggrep -l [-n LINES] [PATHS...]        List metadata across figures or directories");
+    println!("    pnggrep --cat <KEY> <FILE>              Print raw value of a metadata key\n");
     println!("OPTIONS:");
     println!("    -l                          List metadata mode (no pattern required)");
     println!("    -n <LINES>                  Max lines to show per key in list mode [default: 3, 0=all]");
     println!("    -k, --key <SUBSTRING>       Filter metadata keys matching substring (case-insensitive)");
     println!("    -K, --keys-only             Show only matching metadata key names, omitting lines");
     println!("    -s, --skip, --exclude <DIR> Skip specific directory during traversal (repeatable)");
-    println!("    --cat, -cat <KEY>           Dump exact value without formatting");
+    println!("    --cat, -cat <KEY>           Dump exact value without formatting (1 file only)");
     println!("    -h, --help                  Show help information");
 }
 
@@ -99,51 +99,64 @@ fn main() {
         i += 1;
     }
 
+    // -------------------------------------------------------------------------
+    // 1. --cat Mode (Strict single-file requirement)
+    // -------------------------------------------------------------------------
     if let Some(key) = cat_key {
-        if positional.is_empty() {
-            eprintln!("Error: --cat requires a file path: pnggrep --cat <KEY> <FILE>");
+        if positional.len() != 1 {
+            eprintln!(
+                "Error: --cat requires exactly one target file: pnggrep --cat <KEY> <FILE>\nReceived {} path argument(s).",
+                positional.len()
+            );
             std::process::exit(1);
         }
         cat_metadata(Path::new(&positional[0]), &key);
         return;
     }
 
+    // -------------------------------------------------------------------------
+    // 2. -l (List) Mode (Multiple files/directories supported)
+    // -------------------------------------------------------------------------
     if is_list {
-        let target_dir = if !positional.is_empty() {
-            PathBuf::from(&positional[0])
+        let targets: Vec<PathBuf> = if positional.is_empty() {
+            vec![PathBuf::from(".")]
         } else {
-            PathBuf::from(".")
-        };
-        let mode = RunMode::List {
-            max_lines,
-            key_filter: key_filter.clone(),
-        };
-        if target_dir.is_file() {
-            list_file(&target_dir, max_lines, key_filter.as_deref());
-        } else {
-            visit_dirs(&target_dir, &mode, &custom_excludes);
-        }
-    } else {
-        if positional.is_empty() {
-            eprintln!("Error: Missing search pattern. Use -l to list all metadata.");
-            std::process::exit(1);
-        }
-        let pattern = positional[0].to_lowercase();
-        let target_dir = if positional.len() >= 2 {
-            PathBuf::from(&positional[1])
-        } else {
-            PathBuf::from(".")
+            positional.into_iter().map(PathBuf::from).collect()
         };
 
-        if target_dir.is_file() {
-            search_file(&target_dir, &pattern, key_filter.as_deref(), keys_only);
-        } else {
-            let mode = RunMode::Search {
-                pattern,
-                key_filter,
-                keys_only,
-            };
-            visit_dirs(&target_dir, &mode, &custom_excludes);
+        let mode = RunMode::List {
+            max_lines,
+            key_filter,
+        };
+
+        for target in &targets {
+            process_target(target, &mode, &custom_excludes);
         }
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. Search Mode (Pattern + multiple files/directories supported)
+    // -------------------------------------------------------------------------
+    if positional.is_empty() {
+        eprintln!("Error: Missing search pattern. Use -l to list all metadata.");
+        std::process::exit(1);
+    }
+
+    let pattern = positional[0].to_lowercase();
+    let targets: Vec<PathBuf> = if positional.len() > 1 {
+        positional[1..].iter().map(PathBuf::from).collect()
+    } else {
+        vec![PathBuf::from(".")]
+    };
+
+    let mode = RunMode::Search {
+        pattern,
+        key_filter,
+        keys_only,
+    };
+
+    for target in &targets {
+        process_target(target, &mode, &custom_excludes);
     }
 }
