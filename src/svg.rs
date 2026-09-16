@@ -205,21 +205,45 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-pub fn extract_svg_metadata<R: Read>(reader: &mut R) -> std::io::Result<Vec<MetadataEntry>> {
-    let mut content = String::new();
-    reader.take(MAX_SVG_READ_SIZE).read_to_string(&mut content)?;
-
-    let search_area = if let Some(start) = content.find("<metadata") {
-        if let Some(end) = content[start..].find("</metadata>") {
-            &content[start..start + end + 11]
+/// Checks whether an inner XML slice contains child elements (excluding CDATA blocks and comments)
+fn has_child_elements(inner: &str) -> bool {
+    let mut cursor = 0;
+    while let Some(pos) = inner[cursor..].find('<') {
+        let abs = cursor + pos;
+        let rest = &inner[abs..];
+        if rest.starts_with("<![CDATA[") {
+            if let Some(end) = rest.find("]]>") {
+                cursor = abs + end + 3;
+            } else {
+                break;
+            }
+        } else if rest.starts_with("<!--") {
+            if let Some(end) = rest.find("-->") {
+                cursor = abs + end + 3;
+            } else {
+                break;
+            }
+        } else if rest.starts_with("</") {
+            cursor = abs + 2;
         } else {
-            &content[..]
+            return true;
         }
-    } else {
-        &content[..]
-    };
+    }
+    false
+}
 
-    let mut entries = Vec::new();
+/// Strips wrapping CDATA markup if present
+fn unwrap_cdata(s: &str) -> &str {
+    let trimmed = s.trim();
+    if trimmed.starts_with("<![CDATA[") && trimmed.ends_with("]]>") {
+        &trimmed[9..trimmed.len() - 3]
+    } else {
+        trimmed
+    }
+}
+
+/// Parses the inner contents of a <metadata> block into key-value entries
+fn parse_metadata_block(search_area: &str, entries: &mut Vec<MetadataEntry>) {
     let mut cursor = 0;
 
     while let Some(tag_start) = search_area[cursor..].find('<') {
@@ -260,11 +284,12 @@ pub fn extract_svg_metadata<R: Read>(reader: &mut R) -> std::io::Result<Vec<Meta
             let abs_close = tag_open_end + 1 + close_pos;
             let inner_raw = &search_area[tag_open_end + 1..abs_close];
 
-            let has_child_tags = inner_raw.contains('<') && !inner_raw.contains("<![CDATA[");
-            if !has_child_tags {
+            // Only extract leaf elements (tags that do not contain child elements)
+            if !has_child_elements(inner_raw) {
                 let clean_name = raw_tag_name.split(':').last().unwrap_or(raw_tag_name);
                 let key_name = capitalize(clean_name);
-                let unescaped_text = xml_unescape(inner_raw.trim());
+                let text_content = unwrap_cdata(inner_raw);
+                let unescaped_text = xml_unescape(text_content.trim());
 
                 if unescaped_text.starts_with('{') && unescaped_text.ends_with('}') {
                     if let Some(json_entries) = parse_json_object(&unescaped_text, 0) {
@@ -287,6 +312,28 @@ pub fn extract_svg_metadata<R: Read>(reader: &mut R) -> std::io::Result<Vec<Meta
                     });
                 }
             }
+        }
+    }
+}
+
+pub fn extract_svg_metadata<R: Read>(reader: &mut R) -> std::io::Result<Vec<MetadataEntry>> {
+    let mut content = String::new();
+    reader.take(MAX_SVG_READ_SIZE).read_to_string(&mut content)?;
+
+    let mut entries = Vec::new();
+    let mut search_pos = 0;
+
+    // Strict metadata scoping: only parse inside <metadata>...</metadata> blocks
+    while let Some(start_offset) = content[search_pos..].find("<metadata") {
+        let abs_start = search_pos + start_offset;
+        let close_tag = "</metadata>";
+        if let Some(end_offset) = content[abs_start..].find(close_tag) {
+            let abs_end = abs_start + end_offset + close_tag.len();
+            let block = &content[abs_start..abs_end];
+            parse_metadata_block(block, &mut entries);
+            search_pos = abs_end;
+        } else {
+            break;
         }
     }
 
@@ -339,6 +386,20 @@ mod tests {
         let mut cursor = Cursor::new(svg_simple.as_bytes());
         let entries = extract_svg_metadata(&mut cursor).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_svg_flamegraph_ignored() {
+        let flamegraph_svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800">
+<style>.func_g:hover { stroke:black; }</style>
+<script><![CDATA[ function init() { alert('zoom'); } ]]></script>
+<text>Flame Graph</text>
+<g class="func_g"><title>kernel_func (150 samples)</title><rect width="10" height="10"/></g>
+<g class="func_g"><title>mean_n_ (400 samples)</title><rect width="20" height="10"/></g>
+</svg>"#;
+        let mut cursor = Cursor::new(flamegraph_svg.as_bytes());
+        let entries = extract_svg_metadata(&mut cursor).unwrap();
+        assert!(entries.is_empty(), "FlameGraph elements must not be treated as metadata");
     }
 
     #[test]

@@ -25,6 +25,7 @@ fn print_help() {
     println!("    -F, --files-only            Print only filenames of matching figures (no details)");
     println!("        --files-with-matches    Alias for -F");
     println!("        --files-with-match      Alias for -F");
+    println!("        --json                  Emit results as line-delimited JSON (ndjson)");
     println!("    --sanitize                  Strip sensitive metadata and create _sanitized files");
     println!("    -s, --skip, --exclude <DIR> Skip specific directory during traversal (repeatable)");
     println!("    --cat, -cat <KEY>           Dump exact value without formatting (1 file only)");
@@ -44,6 +45,7 @@ fn main() {
     let mut key_filter: Option<String> = None;
     let mut keys_only = false;
     let mut files_only = false;
+    let mut is_json = false;
     let mut cat_key: Option<String> = None;
     let mut custom_excludes = Vec::new();
     let mut positional = Vec::new();
@@ -60,6 +62,9 @@ fn main() {
             }
             "--sanitize" => {
                 is_sanitize = true;
+            }
+            "--json" => {
+                is_json = true;
             }
             "-n" => {
                 if i + 1 < args.len() {
@@ -158,6 +163,7 @@ fn main() {
         let mode = RunMode::List {
             max_lines,
             key_filter,
+            json: is_json,
         };
 
         for target in &targets {
@@ -186,6 +192,7 @@ fn main() {
         key_filter,
         keys_only,
         files_only,
+        json: is_json,
     };
 
     for target in &targets {

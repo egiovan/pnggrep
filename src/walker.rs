@@ -6,7 +6,6 @@ use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::Path;
 
-
 pub const DEFAULT_IGNORED_DIRS: &[&str] = &[
     "venv", ".venv", "env", ".env", "__pycache__", ".git", ".hg", ".svn",
     "target", "build", "dist", "node_modules", ".tox", ".pytest_cache",
@@ -18,7 +17,6 @@ pub const SILENT_IGNORED_DIRS: &[&str] = &[
     ".git", "__pycache__", ".hg", ".svn",
 ];
 
-
 #[derive(Clone, Debug)]
 pub enum RunMode {
     Search {
@@ -26,11 +24,35 @@ pub enum RunMode {
         key_filter: Option<String>,
         keys_only: bool,
         files_only: bool,
+        json: bool,
     },
     List {
         max_lines: usize,
         key_filter: Option<String>,
+        json: bool,
     },
+}
+
+/// Zero-dependency JSON string escaping (handles quotes, slashes, control characters)
+pub fn escape_json(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0C' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 pub fn sanitize_for_terminal(input: &str) -> String {
@@ -127,10 +149,93 @@ pub fn search_file(
     key_filter: Option<&str>,
     keys_only: bool,
     files_only: bool,
+    json: bool,
 ) {
     if let Ok(entries) = extract_metadata(path) {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        let is_sanitized = entries.iter().any(|e| {
+            (e.key.eq_ignore_ascii_case("SanitizedBy")
+                || e.key.eq_ignore_ascii_case("Keywords/sanitized_by")
+                || e.key.eq_ignore_ascii_case("Description/sanitized_by")
+                || e.key.ends_with("/sanitized_by"))
+                && e.value.eq_ignore_ascii_case("pnggrep")
+        });
+
+        if json {
+            let mut matched_entries: Vec<(String, Vec<(usize, String)>)> = Vec::new();
+
+            for entry in entries {
+                if let Some(kf) = key_filter {
+                    if !entry.key.to_lowercase().contains(kf) {
+                        continue;
+                    }
+                }
+
+                let matches_key = entry.key.to_lowercase().contains(pattern_lower);
+                let matches_val = entry.value.to_lowercase().contains(pattern_lower);
+
+                if matches_key || matches_val {
+                    if files_only {
+                        println!(
+                            "{{\"path\":\"{}\",\"format\":\"{}\",\"is_sanitized\":{}}}",
+                            escape_json(&path.display().to_string()),
+                            escape_json(&ext),
+                            is_sanitized
+                        );
+                        return;
+                    }
+
+                    let mut matched_lines = Vec::new();
+                    if !keys_only {
+                        for (line_idx, line) in entry.value.lines().enumerate() {
+                            if line.to_lowercase().contains(pattern_lower) {
+                                matched_lines.push((line_idx + 1, line.to_string()));
+                            }
+                        }
+                    }
+                    matched_entries.push((entry.key, matched_lines));
+                }
+            }
+
+            if !matched_entries.is_empty() {
+                let mut json_str = String::new();
+                json_str.push_str(&format!(
+                    "{{\"path\":\"{}\",\"format\":\"{}\",\"is_sanitized\":{},\"matches\":[",
+                    escape_json(&path.display().to_string()),
+                    escape_json(&ext),
+                    is_sanitized
+                ));
+
+                for (i, (key, lines)) in matched_entries.iter().enumerate() {
+                    if i > 0 {
+                        json_str.push(',');
+                    }
+                    json_str.push_str(&format!("{{\"key\":\"{}\",\"lines\":[", escape_json(key)));
+                    for (j, (line_no, line_content)) in lines.iter().enumerate() {
+                        if j > 0 {
+                            json_str.push(',');
+                        }
+                        json_str.push_str(&format!(
+                            "{{\"line_number\":{},\"content\":\"{}\"}}",
+                            line_no,
+                            escape_json(line_content)
+                        ));
+                    }
+                    json_str.push_str("]}");
+                }
+                json_str.push_str("]}");
+                println!("{}", json_str);
+            }
+            return;
+        }
+
+        // Terminal Mode
         for entry in entries {
-            // Apply key substring filter if requested
             if let Some(kf) = key_filter {
                 if !entry.key.to_lowercase().contains(kf) {
                     continue;
@@ -161,8 +266,7 @@ pub fn search_file(
     }
 }
 
-
-pub fn list_file(path: &Path, max_lines: usize, key_filter: Option<&str>) {
+pub fn list_file(path: &Path, max_lines: usize, key_filter: Option<&str>, json: bool) {
     if let Ok(entries) = extract_metadata(path) {
         let filtered: Vec<MetadataEntry> = entries
             .into_iter()
@@ -175,11 +279,49 @@ pub fn list_file(path: &Path, max_lines: usize, key_filter: Option<&str>) {
             })
             .collect();
 
-        // If no keys match the filter, do not display this file
         if filtered.is_empty() {
             return;
         }
 
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        let is_sanitized = filtered.iter().any(|e| {
+            (e.key.eq_ignore_ascii_case("SanitizedBy")
+                || e.key.eq_ignore_ascii_case("Keywords/sanitized_by")
+                || e.key.eq_ignore_ascii_case("Description/sanitized_by")
+                || e.key.ends_with("/sanitized_by"))
+                && e.value.eq_ignore_ascii_case("pnggrep")
+        });
+
+        if json {
+            let mut json_str = String::new();
+            json_str.push_str(&format!(
+                "{{\"path\":\"{}\",\"format\":\"{}\",\"is_sanitized\":{},\"entries\":[",
+                escape_json(&path.display().to_string()),
+                escape_json(&ext),
+                is_sanitized
+            ));
+
+            for (i, entry) in filtered.iter().enumerate() {
+                if i > 0 {
+                    json_str.push(',');
+                }
+                json_str.push_str(&format!(
+                    "{{\"key\":\"{}\",\"value\":\"{}\"}}",
+                    escape_json(&entry.key),
+                    escape_json(&entry.value)
+                ));
+            }
+            json_str.push_str("]}");
+            println!("{}", json_str);
+            return;
+        }
+
+        // Terminal Mode
         println!("\x1b[1;35m{}\x1b[0m", path.display());
 
         for entry in filtered {
@@ -286,12 +428,25 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode, custom_excludes: &[String]) {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                     if is_supported_ext(ext) {
                         match mode {
-                            RunMode::Search { pattern, key_filter, keys_only, files_only } => {
-                                search_file(&path, pattern, key_filter.as_deref(), *keys_only, *files_only)
-                            }
-                            RunMode::List { max_lines, key_filter } => {
-                                list_file(&path, *max_lines, key_filter.as_deref())
-                            }
+                            RunMode::Search {
+                                pattern,
+                                key_filter,
+                                keys_only,
+                                files_only,
+                                json,
+                            } => search_file(
+                                &path,
+                                pattern,
+                                key_filter.as_deref(),
+                                *keys_only,
+                                *files_only,
+                                *json,
+                            ),
+                            RunMode::List {
+                                max_lines,
+                                key_filter,
+                                json,
+                            } => list_file(&path, *max_lines, key_filter.as_deref(), *json),
                         }
                     }
                 }
@@ -306,11 +461,28 @@ pub fn process_target(target: &Path, mode: &RunMode, custom_excludes: &[String])
         if let Some(ext) = target.extension().and_then(|e| e.to_str()) {
             if is_supported_ext(ext) {
                 match mode {
-                    RunMode::Search { pattern, key_filter, keys_only, files_only } => {
-                        search_file(target, pattern, key_filter.as_deref(), *keys_only, *files_only);
+                    RunMode::Search {
+                        pattern,
+                        key_filter,
+                        keys_only,
+                        files_only,
+                        json,
+                    } => {
+                        search_file(
+                            target,
+                            pattern,
+                            key_filter.as_deref(),
+                            *keys_only,
+                            *files_only,
+                            *json,
+                        );
                     }
-                    RunMode::List { max_lines, key_filter } => {
-                        list_file(target, *max_lines, key_filter.as_deref());
+                    RunMode::List {
+                        max_lines,
+                        key_filter,
+                        json,
+                    } => {
+                        list_file(target, *max_lines, key_filter.as_deref(), *json);
                     }
                 }
             } else {
@@ -333,6 +505,13 @@ pub fn process_target(target: &Path, mode: &RunMode, custom_excludes: &[String])
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_escape_json() {
+        let input = "quote: \", backslash: \\, tab: \t, newline: \n";
+        let escaped = escape_json(input);
+        assert_eq!(escaped, "quote: \\\", backslash: \\\\, tab: \\t, newline: \\n");
+    }
 
     #[test]
     fn test_sanitize_terminal_escapes() {
