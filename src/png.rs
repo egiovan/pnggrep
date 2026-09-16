@@ -5,6 +5,10 @@ pub const PNG_MAGIC: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 pub const MAX_METADATA_CHUNK_SIZE: u64 = 16 * 1024 * 1024; // 16 MB limit per chunk
 pub const MAX_DECOMPRESSED_SIZE: usize = 32 * 1024 * 1024;  // 32 MB limit uncompressed
 
+// -----------------------------------------------------------------------------
+// Unix / Linux / macOS: System zlib (Zero external dependencies)
+// -----------------------------------------------------------------------------
+#[cfg(not(windows))]
 #[link(name = "z")]
 extern "C" {
     fn uncompress(
@@ -23,6 +27,7 @@ extern "C" {
     ) -> i32;
 }
 
+#[cfg(not(windows))]
 pub fn decompress_zlib(compressed: &[u8]) -> Option<String> {
     if compressed.is_empty() {
         return None;
@@ -60,6 +65,35 @@ pub fn decompress_zlib(compressed: &[u8]) -> Option<String> {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Windows: flate2 (Pure Rust miniz_oxide backend)
+// -----------------------------------------------------------------------------
+#[cfg(windows)]
+pub fn decompress_zlib(compressed: &[u8]) -> Option<String> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+
+    if compressed.is_empty() {
+        return None;
+    }
+
+    let mut decoder = ZlibDecoder::new(compressed);
+    let mut dest = Vec::new();
+    if decoder
+        .by_ref()
+        .take(MAX_DECOMPRESSED_SIZE as u64)
+        .read_to_end(&mut dest)
+        .is_ok()
+    {
+        String::from_utf8(dest).ok()
+    } else {
+        None
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Chunk Extraction
+// -----------------------------------------------------------------------------
 pub fn extract_png_metadata<R: Read + Seek>(reader: &mut R) -> std::io::Result<Vec<MetadataEntry>> {
     let mut magic = [0u8; 8];
     if reader.read_exact(&mut magic).is_err() || magic != PNG_MAGIC {
@@ -150,6 +184,9 @@ pub fn extract_png_metadata<R: Read + Seek>(reader: &mut R) -> std::io::Result<V
     Ok(entries)
 }
 
+// -----------------------------------------------------------------------------
+// Unit Tests
+// -----------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +201,7 @@ mod tests {
         chunk
     }
 
+    #[cfg(not(windows))]
     fn compress_data(data: &[u8]) -> Vec<u8> {
         let mut dest_len = data.len().saturating_add(64);
         let mut dest = vec![0u8; dest_len];
@@ -178,6 +216,17 @@ mod tests {
         assert_eq!(ret, 0, "zlib compression failed");
         dest.truncate(dest_len);
         dest
+    }
+
+    #[cfg(windows)]
+    fn compress_data(data: &[u8]) -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
     }
 
     #[test]
