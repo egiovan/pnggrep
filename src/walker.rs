@@ -25,6 +25,7 @@ pub enum RunMode {
         pattern: String,
         key_filter: Option<String>,
         keys_only: bool,
+        files_only: bool,
     },
     List {
         max_lines: usize,
@@ -120,8 +121,13 @@ pub fn extract_metadata(path: &Path) -> std::io::Result<Vec<MetadataEntry>> {
     }
 }
 
-
-pub fn search_file(path: &Path, pattern_lower: &str, key_filter: Option<&str>, keys_only: bool) {
+pub fn search_file(
+    path: &Path,
+    pattern_lower: &str,
+    key_filter: Option<&str>,
+    keys_only: bool,
+    files_only: bool,
+) {
     if let Ok(entries) = extract_metadata(path) {
         for entry in entries {
             // Apply key substring filter if requested
@@ -134,6 +140,11 @@ pub fn search_file(path: &Path, pattern_lower: &str, key_filter: Option<&str>, k
             if entry.value.to_lowercase().contains(pattern_lower)
                 || entry.key.to_lowercase().contains(pattern_lower)
             {
+                if files_only {
+                    println!("{}", path.display());
+                    return;
+                }
+
                 let clean_key = sanitize_for_terminal(&entry.key);
                 println!("\x1b[35m{}\x1b[0m [\x1b[36m{}\x1b[0m]", path.display(), clean_key);
 
@@ -275,8 +286,8 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode, custom_excludes: &[String]) {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                     if is_supported_ext(ext) {
                         match mode {
-                            RunMode::Search { pattern, key_filter, keys_only } => {
-                                search_file(&path, pattern, key_filter.as_deref(), *keys_only)
+                            RunMode::Search { pattern, key_filter, keys_only, files_only } => {
+                                search_file(&path, pattern, key_filter.as_deref(), *keys_only, *files_only)
                             }
                             RunMode::List { max_lines, key_filter } => {
                                 list_file(&path, *max_lines, key_filter.as_deref())
@@ -295,8 +306,8 @@ pub fn process_target(target: &Path, mode: &RunMode, custom_excludes: &[String])
         if let Some(ext) = target.extension().and_then(|e| e.to_str()) {
             if is_supported_ext(ext) {
                 match mode {
-                    RunMode::Search { pattern, key_filter, keys_only } => {
-                        search_file(target, pattern, key_filter.as_deref(), *keys_only);
+                    RunMode::Search { pattern, key_filter, keys_only, files_only } => {
+                        search_file(target, pattern, key_filter.as_deref(), *keys_only, *files_only);
                     }
                     RunMode::List { max_lines, key_filter } => {
                         list_file(target, *max_lines, key_filter.as_deref());

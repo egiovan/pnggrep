@@ -22,6 +22,9 @@ fn print_help() {
     println!("    -n <LINES>                  Max lines to show per key in list mode [default: 3, 0=all]");
     println!("    -k, --key <SUBSTRING>       Filter metadata keys matching substring (case-insensitive)");
     println!("    -K, --keys-only             Show only matching metadata key names, omitting lines");
+    println!("    -F, --files-only            Print only filenames of matching figures (no details)");
+    println!("        --files-with-matches    Alias for -F");
+    println!("        --files-with-match      Alias for -F");
     println!("    --sanitize                  Strip sensitive metadata and create _sanitized files");
     println!("    -s, --skip, --exclude <DIR> Skip specific directory during traversal (repeatable)");
     println!("    --cat, -cat <KEY>           Dump exact value without formatting (1 file only)");
@@ -40,6 +43,7 @@ fn main() {
     let mut max_lines = 3usize;
     let mut key_filter: Option<String> = None;
     let mut keys_only = false;
+    let mut files_only = false;
     let mut cat_key: Option<String> = None;
     let mut custom_excludes = Vec::new();
     let mut positional = Vec::new();
@@ -77,6 +81,9 @@ fn main() {
             }
             "-K" | "--keys-only" => {
                 keys_only = true;
+            }
+            "-F" | "--files-only" | "--files-with-matches" | "--files-with-match" => {
+                files_only = true;
             }
             "-s" | "--skip" | "--exclude" => {
                 if i + 1 < args.len() {
@@ -178,6 +185,7 @@ fn main() {
         pattern,
         key_filter,
         keys_only,
+        files_only,
     };
 
     for target in &targets {
