@@ -4,15 +4,15 @@ smart_savefig.py - Reproducible Scientific Visualization Module
 Drop-in replacement for `matplotlib.pyplot.savefig`.
 Automatically embeds caller script source code, file system context,
 runtime timestamp, Git commit SHA, Git commit message, sys.path entries,
-fusion shot/pulse identifiers, and local module dependencies into image metadata
-for PNG, SVG, and PDF formats.
+fusion shot/pulse identifiers, local module dependencies, and database schemas
+into image metadata for PNG, SVG, and PDF formats.
 
 Default resolution: 300 DPI.
 
 Usage examples:
-    savefig("equilibrium.png", shot=92185)
-    savefig("comparison.pdf", shots=[92185, 92186], modules=[ge, gp])
-    savefig("profile.svg", pulse=92185, dpi=600)
+    savefig("equilibrium.png", shot=92185, database=df_plasma)
+    savefig("comparison.pdf", shots=[92185, 92186], databases=[df_mhd, ds_equil])
+    savefig("analysis.svg", pulse=92185, databases={"mhd": df_mhd}, modules=[ge, gp])
 
 Alerts the user on stderr if saving from a dirty or untracked repository state.
 Guarantees immutability of system provenance keys against user metadata collisions.
@@ -93,7 +93,7 @@ RESERVED_SYSTEM_KEYS = {
     "shots",
     "pulse",
     "pulses",
-    # Reserved for upcoming database extensions
+    # Database and tabular metadata
     "database",
     "databases",
 }
@@ -122,6 +122,8 @@ def isolate_user_metadata(user_metadata: dict) -> dict:
             or norm_key.startswith("sourcecode:")
             or norm_key.startswith("localmodule/")
             or norm_key.startswith("localmodule:")
+            or norm_key.startswith("database/")
+            or norm_key.startswith("database:")
         )
 
         if is_conflict:
@@ -167,6 +169,155 @@ def _normalize_sequence(val):
         if norm is not None and norm not in result:
             result.append(norm)
     return result
+
+
+def _extract_database_schema(db, label: str = None) -> dict:
+    """
+    Extract structural schema from a database object (Pandas DataFrame/Series,
+    xarray Dataset/DataArray, file path, or dictionary) via duck typing.
+    Never extracts raw numeric array values.
+    """
+    if db is None:
+        return {}
+
+    type_name = f"{db.__class__.__module__}.{db.__class__.__name__}"
+    schema = {"type": type_name}
+    if label:
+        schema["name"] = str(label)
+
+    # 1. Path or file string
+    if isinstance(db, (str, Path)):
+        schema["type"] = "file_path"
+        schema["path"] = str(db)
+        if not label:
+            schema["name"] = Path(str(db)).name
+        return schema
+
+    # 2. Pandas DataFrame duck typing
+    if hasattr(db, "columns") and hasattr(db, "shape") and hasattr(db, "dtypes"):
+        schema["shape"] = list(db.shape)
+        schema["columns"] = [str(c) for c in db.columns]
+        idx_name = getattr(getattr(db, "index", None), "name", None)
+        if idx_name:
+            schema["index_name"] = str(idx_name)
+        attrs = getattr(db, "attrs", None)
+        if isinstance(attrs, dict) and attrs:
+            schema["attrs"] = {str(k): str(v) for k, v in attrs.items()}
+        return schema
+
+    # 3. Pandas Series duck typing
+    if hasattr(db, "index") and hasattr(db, "shape") and hasattr(db, "dtype") and not hasattr(db, "columns"):
+        schema["shape"] = list(db.shape)
+        series_name = getattr(db, "name", None)
+        if series_name is not None and not label:
+            schema["name"] = str(series_name)
+        idx_name = getattr(getattr(db, "index", None), "name", None)
+        if idx_name:
+            schema["index_name"] = str(idx_name)
+        attrs = getattr(db, "attrs", None)
+        if isinstance(attrs, dict) and attrs:
+            schema["attrs"] = {str(k): str(v) for k, v in attrs.items()}
+        return schema
+
+    # 4. xarray Dataset duck typing
+    if hasattr(db, "data_vars") and hasattr(db, "coords") and hasattr(db, "dims"):
+        schema["dims"] = {str(k): int(v) for k, v in db.dims.items()}
+        schema["coords"] = [str(c) for c in db.coords]
+        schema["data_vars"] = [str(v) for v in db.data_vars]
+        attrs = getattr(db, "attrs", None)
+        if isinstance(attrs, dict) and attrs:
+            schema["attrs"] = {str(k): str(v) for k, v in attrs.items()}
+        return schema
+
+    # 5. xarray DataArray duck typing
+    if hasattr(db, "coords") and hasattr(db, "dims") and (hasattr(db, "values") or hasattr(db, "data")) and not hasattr(db, "data_vars"):
+        schema["shape"] = list(db.shape) if hasattr(db, "shape") else []
+        schema["dims"] = [str(d) for d in db.dims]
+        schema["coords"] = [str(c) for c in db.coords]
+        arr_name = getattr(db, "name", None)
+        if arr_name is not None and not label:
+            schema["name"] = str(arr_name)
+        attrs = getattr(db, "attrs", None)
+        if isinstance(attrs, dict) and attrs:
+            schema["attrs"] = {str(k): str(v) for k, v in attrs.items()}
+        return schema
+
+    # 6. Generic dictionary
+    if isinstance(db, dict):
+        schema["type"] = "dict"
+        schema["keys"] = [str(k) for k in list(db.keys())[:50]]
+        return schema
+
+    # 7. Fallback
+    schema["repr"] = repr(db)[:200]
+    return schema
+
+
+def _collect_database_schemas(database, databases) -> list:
+    """Collect and normalize database schemas from database and databases arguments."""
+    items = []
+    if database is not None:
+        items.append((None, database))
+    if databases is not None:
+        if isinstance(databases, dict):
+            for k, v in databases.items():
+                items.append((str(k), v))
+        elif isinstance(databases, (list, tuple, set)):
+            for v in databases:
+                items.append((None, v))
+        else:
+            items.append((None, databases))
+
+    schemas = []
+    for label, db_obj in items:
+        extracted = _extract_database_schema(db_obj, label=label)
+        if extracted:
+            schemas.append(extracted)
+    return schemas
+
+
+def _format_databases_text(schemas: list) -> str:
+    """
+    Format database schemas into a line-delimited stream:
+        %%% Database: <name> [<type>]
+        Columns: ...
+        Shape: ...
+    """
+    if not schemas:
+        return ""
+
+    blocks = []
+    for s in schemas:
+        name_part = f" {s['name']}" if s.get("name") else ""
+        type_part = s.get("type", "Unknown")
+        lines = [f"%%% Database:{name_part} [{type_part}]"]
+
+        if "shape" in s:
+            lines.append(f"  Shape: {tuple(s['shape'])}")
+        if "dims" in s:
+            lines.append(f"  Dims: {s['dims']}")
+        if "columns" in s:
+            cols = s["columns"]
+            cols_preview = ", ".join(cols[:25])
+            if len(cols) > 25:
+                cols_preview += f", ... ({len(cols)} total)"
+            lines.append(f"  Columns: {cols_preview}")
+        if "data_vars" in s:
+            lines.append(f"  DataVars: {', '.join(s['data_vars'])}")
+        if "coords" in s:
+            lines.append(f"  Coords: {', '.join(s['coords'])}")
+        if "index_name" in s:
+            lines.append(f"  Index: {s['index_name']}")
+        if "path" in s:
+            lines.append(f"  Path: {s['path']}")
+        if "keys" in s:
+            lines.append(f"  Keys: {', '.join(s['keys'])}")
+        if s.get("attrs"):
+            lines.append(f"  Attrs: {s['attrs']}")
+
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)
 
 
 def _get_sys_path() -> list:
@@ -428,12 +579,14 @@ def savefig(
     shots=None,
     pulse=None,
     pulses=None,
+    database=None,
+    databases=None,
     dpi=300,
     **kwargs,
 ):
     """
     Save a Matplotlib figure embedding caller source code, Git metadata,
-    sys.path entries, and optional fusion shot/pulse parameters.
+    sys.path entries, fusion shot/pulse parameters, and database schemas.
 
     Parameters:
         fname: Output filename or path (.png, .svg, or .pdf).
@@ -444,6 +597,8 @@ def savefig(
         shots: Sequence of fusion shot identifiers (list, tuple, set).
         pulse: Single fusion pulse identifier (int or str).
         pulses: Sequence of fusion pulse identifiers (list, tuple, set).
+        database: Single database/table (DataFrame, Dataset, file path, dict).
+        databases: Sequence or dict of databases/tables.
         dpi: Resolution in dots per inch [default: 300].
         **kwargs: Extra keyword arguments forwarded to matplotlib.pyplot.savefig.
     """
@@ -461,13 +616,17 @@ def savefig(
         pulse = kwargs.pop("pulse", None)
     if pulses is None:
         pulses = kwargs.pop("pulses", None)
+    if database is None:
+        database = kwargs.pop("database", None)
+    if databases is None:
+        databases = kwargs.pop("databases", None)
 
     ext = Path(fname).suffix.lower()
     ctx = _get_caller_context(explicit_modules=modules)
     raw_user_metadata = dict(kwargs.pop("metadata", {}) or {})
     user_metadata = isolate_user_metadata(raw_user_metadata)
 
-    # Process fusion parameters
+    # 1. Process fusion parameters
     fusion_ctx = {}
     if shot is not None:
         fusion_ctx["shot"] = _normalize_int_or_str(shot)
@@ -479,6 +638,11 @@ def savefig(
         fusion_ctx["pulses"] = _normalize_sequence(pulses)
 
     ctx.update(fusion_ctx)
+
+    # 2. Process database schemas
+    db_schemas = _collect_database_schemas(database, databases)
+    if db_schemas:
+        ctx["databases"] = db_schemas
 
     # Alert the user if the repository state is dirty
     if ctx.get("git_dirty"):
@@ -524,6 +688,10 @@ def savefig(
             meta["Pulse"] = str(fusion_ctx["pulse"])
         if "pulses" in fusion_ctx:
             meta["Pulses"] = json.dumps(fusion_ctx["pulses"])
+
+        # Embed database schemas as line-delimited stream
+        if db_schemas:
+            meta["Databases"] = _format_databases_text(db_schemas)
 
         if "git_commit" in ctx:
             meta["GitCommit"] = ctx["git_commit"]
@@ -706,6 +874,16 @@ if __name__ == "__main__":
             mod_names = re.findall(r"^%%%\s*(\S+)\s*%", local_mods_raw, flags=re.MULTILINE)
             if mod_names:
                 print(f"# Local Modules: {', '.join(mod_names)}")
+
+        db_raw = meta.get("Databases") or meta.get("databases")
+        if isinstance(db_raw, list):
+            db_names = [d.get("name") or d.get("type") for d in db_raw if isinstance(d, dict)]
+            if db_names:
+                print(f"# Databases:     {', '.join(db_names)}")
+        elif isinstance(db_raw, str):
+            db_names = re.findall(r"^%%%\s*Database:\s*(\S+)", db_raw, flags=re.MULTILINE)
+            if db_names:
+                print(f"# Databases:     {', '.join(db_names)}")
 
         print("-" * 60)
         print(source)
