@@ -3,15 +3,16 @@ smart_savefig.py - Reproducible Scientific Visualization Module
 
 Drop-in replacement for `matplotlib.pyplot.savefig`.
 Automatically embeds caller script source code, file system context,
-runtime timestamp, Git commit SHA, Git commit message, and sys.path entries
-into image metadata for PNG, SVG, and PDF formats.
+runtime timestamp, Git commit SHA, Git commit message, sys.path entries,
+fusion shot/pulse identifiers, and local module dependencies into image metadata
+for PNG, SVG, and PDF formats.
 
-Optionally embeds full source code of specified local module objects via `modules=[...]`:
-    savefig("fig.png", modules=[ge, gp])
+Default resolution: 300 DPI.
 
-Local modules are formatted as a line-delimited stream:
-    %%% <modulename> % <relpath>
-    <source code...>
+Usage examples:
+    savefig("equilibrium.png", shot=92185)
+    savefig("comparison.pdf", shots=[92185, 92186], modules=[ge, gp])
+    savefig("profile.svg", pulse=92185, dpi=600)
 
 Alerts the user on stderr if saving from a dirty or untracked repository state.
 Guarantees immutability of system provenance keys against user metadata collisions.
@@ -87,11 +88,12 @@ RESERVED_SYSTEM_KEYS = {
     "syspath",
     "localmodules",
     "modules",
-    # Reserved for upcoming extensions
+    # Fusion-specific keys
     "shot",
     "shots",
     "pulse",
     "pulses",
+    # Reserved for upcoming database extensions
     "database",
     "databases",
 }
@@ -133,6 +135,38 @@ def isolate_user_metadata(user_metadata: dict) -> dict:
             sanitized[key] = value
 
     return sanitized
+
+
+def _normalize_int_or_str(val):
+    """Convert single shot/pulse identifier into int if numeric, else trimmed str."""
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    s = str(val).strip()
+    try:
+        return int(s)
+    except ValueError:
+        return s
+
+
+def _normalize_sequence(val):
+    """Convert sequence of shot/pulse identifiers into a deduplicated list."""
+    if val is None:
+        return None
+    if isinstance(val, (int, str)):
+        items = [val]
+    elif isinstance(val, (list, tuple, set)):
+        items = list(val)
+    else:
+        items = [val]
+
+    result = []
+    for x in items:
+        norm = _normalize_int_or_str(x)
+        if norm is not None and norm not in result:
+            result.append(norm)
+    return result
 
 
 def _get_sys_path() -> list:
@@ -386,29 +420,65 @@ def _get_caller_context(explicit_modules=None) -> dict:
     return info
 
 
-def savefig(fname, fig=None, modules=None, **kwargs):
+def savefig(
+    fname,
+    fig=None,
+    modules=None,
+    shot=None,
+    shots=None,
+    pulse=None,
+    pulses=None,
+    dpi=300,
+    **kwargs,
+):
     """
     Save a Matplotlib figure embedding caller source code, Git metadata,
-    and sys.path entries.
+    sys.path entries, and optional fusion shot/pulse parameters.
 
     Parameters:
         fname: Output filename or path (.png, .svg, or .pdf).
         fig: matplotlib.figure.Figure instance (defaults to plt.gcf()).
         modules: Optional list/tuple of imported module objects whose source code
                  should be embedded (e.g. `modules=[ge, gp]`).
+        shot: Single fusion shot identifier (int or str).
+        shots: Sequence of fusion shot identifiers (list, tuple, set).
+        pulse: Single fusion pulse identifier (int or str).
+        pulses: Sequence of fusion pulse identifiers (list, tuple, set).
+        dpi: Resolution in dots per inch [default: 300].
         **kwargs: Extra keyword arguments forwarded to matplotlib.pyplot.savefig.
     """
     if fig is None:
         fig = plt.gcf()
 
-    # Support passing modules via kwargs as well
+    # Fallback checks from kwargs
     if modules is None:
         modules = kwargs.pop("include_modules", None)
+    if shot is None:
+        shot = kwargs.pop("shot", None)
+    if shots is None:
+        shots = kwargs.pop("shots", None)
+    if pulse is None:
+        pulse = kwargs.pop("pulse", None)
+    if pulses is None:
+        pulses = kwargs.pop("pulses", None)
 
     ext = Path(fname).suffix.lower()
     ctx = _get_caller_context(explicit_modules=modules)
     raw_user_metadata = dict(kwargs.pop("metadata", {}) or {})
     user_metadata = isolate_user_metadata(raw_user_metadata)
+
+    # Process fusion parameters
+    fusion_ctx = {}
+    if shot is not None:
+        fusion_ctx["shot"] = _normalize_int_or_str(shot)
+    if shots is not None:
+        fusion_ctx["shots"] = _normalize_sequence(shots)
+    if pulse is not None:
+        fusion_ctx["pulse"] = _normalize_int_or_str(pulse)
+    if pulses is not None:
+        fusion_ctx["pulses"] = _normalize_sequence(pulses)
+
+    ctx.update(fusion_ctx)
 
     # Alert the user if the repository state is dirty
     if ctx.get("git_dirty"):
@@ -445,13 +515,23 @@ def savefig(fname, fig=None, modules=None, **kwargs):
         if ctx["local_modules"]:
             meta["LocalModules"] = ctx["local_modules"]
 
+        # Embed fusion keys as standalone PNG chunks
+        if "shot" in fusion_ctx:
+            meta["Shot"] = str(fusion_ctx["shot"])
+        if "shots" in fusion_ctx:
+            meta["Shots"] = json.dumps(fusion_ctx["shots"])
+        if "pulse" in fusion_ctx:
+            meta["Pulse"] = str(fusion_ctx["pulse"])
+        if "pulses" in fusion_ctx:
+            meta["Pulses"] = json.dumps(fusion_ctx["pulses"])
+
         if "git_commit" in ctx:
             meta["GitCommit"] = ctx["git_commit"]
             meta["GitCommitMessage"] = ctx.get("git_commit_message", "")
             meta["GitDirty"] = str(ctx["git_dirty"])
             meta["GitScriptTracked"] = str(ctx.get("git_script_tracked", False))
 
-        fig.savefig(fname, metadata=meta, **kwargs)
+        fig.savefig(fname, metadata=meta, dpi=dpi, **kwargs)
 
     # -------------------------------------------------------------------------
     # 2. SVG Backend (Dublin Core validation)
@@ -480,7 +560,7 @@ def savefig(fname, fig=None, modules=None, **kwargs):
         payload = json.dumps(final_ctx, indent=2, ensure_ascii=False, default=str)
         svg_meta["Description"] = payload
 
-        fig.savefig(fname, metadata=svg_meta, **kwargs)
+        fig.savefig(fname, metadata=svg_meta, dpi=dpi, **kwargs)
 
     # -------------------------------------------------------------------------
     # 3. PDF Backend (PDF /Info dictionary validation)
@@ -510,13 +590,13 @@ def savefig(fname, fig=None, modules=None, **kwargs):
         payload = json.dumps(final_ctx, indent=2, ensure_ascii=False, default=str)
         native_pdf_meta["Keywords"] = payload
 
-        fig.savefig(fname, metadata=native_pdf_meta, **kwargs)
+        fig.savefig(fname, metadata=native_pdf_meta, dpi=dpi, **kwargs)
 
     # -------------------------------------------------------------------------
     # 4. Other Backends
     # -------------------------------------------------------------------------
     else:
-        fig.savefig(fname, **kwargs)
+        fig.savefig(fname, dpi=dpi, **kwargs)
 
 
 def read_metadata(image_path: str) -> dict:
@@ -613,6 +693,13 @@ if __name__ == "__main__":
         )
         if meta.get("GitCommitMessage") or meta.get("git_commit_message"):
             print(f"# Message: {meta.get('GitCommitMessage') or meta.get('git_commit_message')}")
+
+        for f_key in ["Shot", "shot", "Pulse", "pulse"]:
+            if meta.get(f_key):
+                print(f"# {f_key.capitalize()}:     {meta[f_key]}")
+        for f_key in ["Shots", "shots", "Pulses", "pulses"]:
+            if meta.get(f_key):
+                print(f"# {f_key.capitalize()}:    {meta[f_key]}")
 
         local_mods_raw = meta.get("LocalModules") or meta.get("local_modules", "")
         if local_mods_raw:
