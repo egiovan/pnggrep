@@ -3,8 +3,15 @@ smart_savefig.py - Reproducible Scientific Visualization Module
 
 Drop-in replacement for `matplotlib.pyplot.savefig`.
 Automatically embeds caller script source code, file system context,
-runtime timestamp, Git commit SHA, and Git commit message into image metadata
-for PNG, SVG, and PDF formats.
+runtime timestamp, Git commit SHA, Git commit message, and sys.path entries
+into image metadata for PNG, SVG, and PDF formats.
+
+Optionally embeds full source code of specified local module objects via `modules=[...]`:
+    savefig("fig.png", modules=[ge, gp])
+
+Local modules are formatted as a line-delimited stream:
+    %%% <modulename> % <relpath>
+    <source code...>
 
 Alerts the user on stderr if saving from a dirty or untracked repository state.
 Guarantees immutability of system provenance keys against user metadata collisions.
@@ -18,6 +25,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import types
 import xml.etree.ElementTree as ET
 import matplotlib
 import matplotlib.pyplot as plt
@@ -75,9 +83,11 @@ RESERVED_SYSTEM_KEYS = {
     "gitscripttracked",
     "gitdirtyreason",
     "pythonversion",
-    # Reserved for upcoming extensions
+    # Environment and module hierarchy
     "syspath",
     "localmodules",
+    "modules",
+    # Reserved for upcoming extensions
     "shot",
     "shots",
     "pulse",
@@ -95,8 +105,8 @@ def _normalize_key(key: str) -> str:
 def isolate_user_metadata(user_metadata: dict) -> dict:
     """
     Sanitizes user-provided metadata.
-    If a key collides with a reserved system key, it is remapped to 'User/<Key>'
-    and a warning is emitted to stderr.
+    If a key collides with a reserved system key or dynamic module prefix,
+    it is remapped to 'User/<Key>' and a warning is emitted to stderr.
     """
     if not isinstance(user_metadata, dict):
         return {}
@@ -104,7 +114,15 @@ def isolate_user_metadata(user_metadata: dict) -> dict:
     sanitized = {}
     for key, value in user_metadata.items():
         norm_key = _normalize_key(key)
-        if norm_key in RESERVED_SYSTEM_KEYS:
+        is_conflict = (
+            norm_key in RESERVED_SYSTEM_KEYS
+            or norm_key.startswith("sourcecode/")
+            or norm_key.startswith("sourcecode:")
+            or norm_key.startswith("localmodule/")
+            or norm_key.startswith("localmodule:")
+        )
+
+        if is_conflict:
             safe_key = f"User/{key}"
             sys.stderr.write(
                 f"\x1b[33m[smart_savefig warning]\x1b[0m User metadata key '{key}' "
@@ -117,25 +135,139 @@ def isolate_user_metadata(user_metadata: dict) -> dict:
     return sanitized
 
 
-def _get_git_info(directory: str, script_name: str = None) -> dict:
-    """
-    Query Git to determine the commit hash, commit message, and repository status.
+def _get_sys_path() -> list:
+    """Retrieve normalized, deduplicated list of sys.path directory entries."""
+    seen = set()
+    normalized = []
+    for p in sys.path:
+        if not p:
+            abs_p = os.path.abspath(os.getcwd())
+        else:
+            abs_p = os.path.abspath(p)
+        if abs_p not in seen:
+            seen.add(abs_p)
+            normalized.append(abs_p)
+    return normalized
 
-    Parameters:
-        directory: The working directory of the caller script.
-        script_name: The filename of the caller script to verify tracking.
 
-    Returns:
-        dict containing:
-            - 'git_commit': Full 40-character commit SHA of HEAD.
-            - 'git_commit_message': Subject line of the latest commit.
-            - 'git_dirty': Boolean, True if tracked files are modified or
-                           if the caller script itself is untracked.
-            - 'git_script_tracked': Boolean, True if script is tracked.
-            - 'git_dirty_reason': Explanation of why the state is dirty.
+def _get_explicit_modules(modules_list, caller_dir: Path, caller_path: Path) -> dict:
     """
+    Extract source code and relative paths for an explicitly provided list
+    of Python module objects.
+
+    Excludes:
+      - The caller script itself
+      - smart_savefig.py itself (even if aliased or symlinked)
+    """
+    if not modules_list:
+        return {}
+
+    if not isinstance(modules_list, (list, tuple, set)):
+        modules_list = [modules_list]
+
+    local_mods = {}
     try:
-        # 1. Retrieve the latest commit hash
+        caller_dir_res = caller_dir.resolve()
+        caller_file_res = caller_path.resolve() if caller_path.is_file() else None
+        this_file_res = Path(__file__).resolve()
+    except Exception:
+        return {}
+
+    this_module = sys.modules.get(__name__)
+
+    for mod in modules_list:
+        if mod is None or mod is this_module:
+            continue
+
+        if not isinstance(mod, types.ModuleType):
+            sys.stderr.write(
+                f"\x1b[33m[smart_savefig warning]\x1b[0m Argument in 'modules' is not a module object: {repr(mod)}. Skipped.\n"
+            )
+            continue
+
+        name = getattr(mod, "__name__", None)
+        mod_file = getattr(mod, "__file__", None)
+
+        if not name or not mod_file:
+            continue
+
+        try:
+            raw_mod_path = Path(mod_file)
+            resolved_mod_path = raw_mod_path.resolve()
+
+            # 1. Skip smart_savefig.py under any circumstance
+            if (
+                resolved_mod_path == this_file_res
+                or raw_mod_path.name.startswith("smart_savefig")
+                or resolved_mod_path.name.startswith("smart_savefig")
+                or name.endswith("smart_savefig")
+            ):
+                continue
+
+            # 2. Skip the caller script itself (already under SourceCode)
+            if caller_file_res and (
+                resolved_mod_path == caller_file_res or raw_mod_path == caller_path
+            ):
+                continue
+
+            # 3. Locate source .py if imported via bytecode cache (__pycache__)
+            if resolved_mod_path.suffix == ".pyc":
+                py_candidate = resolved_mod_path.with_suffix(".py")
+                if py_candidate.is_file():
+                    resolved_mod_path = py_candidate
+                elif resolved_mod_path.parent.name == "__pycache__":
+                    parent_py = resolved_mod_path.parent.parent / (
+                        resolved_mod_path.stem.split(".")[0] + ".py"
+                    )
+                    if parent_py.is_file():
+                        resolved_mod_path = parent_py
+
+            if not resolved_mod_path.is_file():
+                continue
+
+            try:
+                rel_path = resolved_mod_path.relative_to(caller_dir_res)
+            except ValueError:
+                rel_path = raw_mod_path.name
+
+            try:
+                source_code = resolved_mod_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except Exception as e:
+                source_code = f"<Error reading source file: {e}>"
+
+            local_mods[name] = {
+                "relpath": str(rel_path).replace("\\", "/"),
+                "source_code": source_code,
+            }
+        except Exception:
+            continue
+
+    return dict(sorted(local_mods.items()))
+
+
+def _format_local_modules(local_mods: dict) -> str:
+    """
+    Format local modules into a single line-delimited string:
+        %%% <modulename> % <relpath>
+        <source_code>
+    """
+    if not local_mods:
+        return ""
+
+    blocks = []
+    for name, info in local_mods.items():
+        relpath = info.get("relpath", "")
+        code = info.get("source_code", "").rstrip("\n")
+        blocks.append(f"%%% {name} % {relpath}\n{code}")
+
+    return "\n\n".join(blocks)
+
+
+def _get_git_info(directory: str, script_name: str = None) -> dict:
+    """Query Git for commit hash, commit message, and repository status."""
+    try:
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
             cwd=directory,
@@ -189,8 +321,8 @@ def _get_git_info(directory: str, script_name: str = None) -> dict:
         return {}
 
 
-def _get_caller_context() -> dict:
-    """Inspect the Python call stack to identify the caller script and location."""
+def _get_caller_context(explicit_modules=None) -> dict:
+    """Inspect the Python call stack to identify caller script and environment."""
     frame = inspect.currentframe()
     this_file = os.path.abspath(__file__)
 
@@ -210,10 +342,13 @@ def _get_caller_context() -> dict:
             "caller_function": "<unknown>",
             "caller_line": 0,
             "timestamp": datetime.now().isoformat(),
+            "python_version": sys.version.split()[0],
+            "sys_path": "\n".join(_get_sys_path()),
+            "local_modules": "",
         }
 
     caller_path = Path(caller_frame.f_code.co_filename).resolve()
-    caller_dir = str(caller_path.parent)
+    caller_dir = caller_path.parent
     caller_name = caller_path.name
 
     if caller_path.is_file():
@@ -224,36 +359,54 @@ def _get_caller_context() -> dict:
     else:
         source_code = f"<Not executed from a disk file: {caller_path}>"
 
+    # Only process modules if explicitly passed
+    if explicit_modules:
+        local_mods_dict = _get_explicit_modules(explicit_modules, caller_dir, caller_path)
+        local_mods_str = _format_local_modules(local_mods_dict)
+    else:
+        local_mods_str = ""
+
+    sys_path_str = "\n".join(_get_sys_path())
+
     info = {
-        "directory": caller_dir,
+        "directory": str(caller_dir),
         "filename": caller_name,
         "filepath": str(caller_path),
         "source_code": source_code,
         "caller_function": caller_frame.f_code.co_name,
         "caller_line": caller_frame.f_lineno,
         "timestamp": datetime.now().isoformat(),
+        "python_version": sys.version.split()[0],
+        "sys_path": sys_path_str,
+        "local_modules": local_mods_str,
     }
 
     script_name = caller_name if caller_path.is_file() else None
-    info.update(_get_git_info(caller_dir, script_name))
+    info.update(_get_git_info(str(caller_dir), script_name))
     return info
 
 
-def savefig(fname, fig=None, **kwargs):
+def savefig(fname, fig=None, modules=None, **kwargs):
     """
-    Save a Matplotlib figure embedding the caller's source code and Git metadata.
-    Prints an alert to stderr if the repository contains uncommitted changes.
+    Save a Matplotlib figure embedding caller source code, Git metadata,
+    and sys.path entries.
 
     Parameters:
         fname: Output filename or path (.png, .svg, or .pdf).
         fig: matplotlib.figure.Figure instance (defaults to plt.gcf()).
+        modules: Optional list/tuple of imported module objects whose source code
+                 should be embedded (e.g. `modules=[ge, gp]`).
         **kwargs: Extra keyword arguments forwarded to matplotlib.pyplot.savefig.
     """
     if fig is None:
         fig = plt.gcf()
 
+    # Support passing modules via kwargs as well
+    if modules is None:
+        modules = kwargs.pop("include_modules", None)
+
     ext = Path(fname).suffix.lower()
-    ctx = _get_caller_context()
+    ctx = _get_caller_context(explicit_modules=modules)
     raw_user_metadata = dict(kwargs.pop("metadata", {}) or {})
     user_metadata = isolate_user_metadata(raw_user_metadata)
 
@@ -281,10 +434,17 @@ def savefig(fname, fig=None, **kwargs):
             "SourcePath": ctx["filepath"],
             "CallerFunction": ctx["caller_function"],
             "Timestamp": ctx["timestamp"],
+            "PythonVersion": ctx["python_version"],
             "SourceCode": ctx["source_code"],
             "Comment": ctx["source_code"],
             "Description": f"Generated by {ctx['filename']} ({ctx['caller_function']})",
+            "SysPath": ctx["sys_path"],
         })
+
+        # Only embed LocalModules if modules were explicitly requested and found
+        if ctx["local_modules"]:
+            meta["LocalModules"] = ctx["local_modules"]
+
         if "git_commit" in ctx:
             meta["GitCommit"] = ctx["git_commit"]
             meta["GitCommitMessage"] = ctx.get("git_commit_message", "")
@@ -314,6 +474,9 @@ def savefig(fname, fig=None, **kwargs):
 
         # System provenance strictly overrides user values
         final_ctx = {**custom_json_metadata, **ctx}
+        if not final_ctx.get("local_modules"):
+            final_ctx.pop("local_modules", None)
+
         payload = json.dumps(final_ctx, indent=2, ensure_ascii=False, default=str)
         svg_meta["Description"] = payload
 
@@ -341,6 +504,9 @@ def savefig(fname, fig=None, **kwargs):
 
         # System provenance strictly overrides user values
         final_ctx = {**custom_json_metadata, **ctx}
+        if not final_ctx.get("local_modules"):
+            final_ctx.pop("local_modules", None)
+
         payload = json.dumps(final_ctx, indent=2, ensure_ascii=False, default=str)
         native_pdf_meta["Keywords"] = payload
 
@@ -441,8 +607,18 @@ if __name__ == "__main__":
     else:
         print(f"# File:    {meta.get('SourceFile') or meta.get('filename')}")
         print(f"# Dir:     {meta.get('SourceDirectory') or meta.get('directory')}")
-        print(f"# Commit:  {meta.get('GitCommit') or meta.get('git_commit')} (Dirty: {meta.get('GitDirty') or meta.get('git_dirty')})")
+        print(
+            f"# Commit:  {meta.get('GitCommit') or meta.get('git_commit')} "
+            f"(Dirty: {meta.get('GitDirty') or meta.get('git_dirty')})"
+        )
         if meta.get("GitCommitMessage") or meta.get("git_commit_message"):
             print(f"# Message: {meta.get('GitCommitMessage') or meta.get('git_commit_message')}")
+
+        local_mods_raw = meta.get("LocalModules") or meta.get("local_modules", "")
+        if local_mods_raw:
+            mod_names = re.findall(r"^%%%\s*(\S+)\s*%", local_mods_raw, flags=re.MULTILINE)
+            if mod_names:
+                print(f"# Local Modules: {', '.join(mod_names)}")
+
         print("-" * 60)
         print(source)
