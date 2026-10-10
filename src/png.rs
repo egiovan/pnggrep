@@ -92,9 +92,17 @@ pub fn decompress_zlib(compressed: &[u8]) -> Option<String> {
 }
 
 // -----------------------------------------------------------------------------
-// Chunk Extraction
+// Chunk Extraction with Lazy Decompression
 // -----------------------------------------------------------------------------
+#[allow(dead_code)]
 pub fn extract_png_metadata<R: Read + Seek>(reader: &mut R) -> std::io::Result<Vec<MetadataEntry>> {
+    extract_png_metadata_filtered(reader, None)
+}
+
+pub fn extract_png_metadata_filtered<R: Read + Seek>(
+    reader: &mut R,
+    key_filter: Option<&dyn Fn(&str) -> bool>,
+) -> std::io::Result<Vec<MetadataEntry>> {
     let mut magic = [0u8; 8];
     if reader.read_exact(&mut magic).is_err() || magic != PNG_MAGIC {
         return Ok(Vec::new());
@@ -123,35 +131,86 @@ pub fn extract_png_metadata<R: Read + Seek>(reader: &mut R) -> std::io::Result<V
             b"IEND" => break,
 
             b"tEXt" => {
-                let mut data = vec![0u8; length as usize];
-                reader.read_exact(&mut data)?;
-                if let Some(pos) = data.iter().position(|&b| b == 0) {
-                    let key = String::from_utf8_lossy(&data[..pos]).to_string();
+                let probe_len = (length as usize).min(80);
+                let mut probe = vec![0u8; probe_len];
+                reader.read_exact(&mut probe)?;
+
+                if let Some(pos) = probe.iter().position(|&b| b == 0) {
+                    let key = String::from_utf8_lossy(&probe[..pos]).to_string();
+
+                    // Lazy check: skip reading remaining uncompressed text if not needed
+                    if let Some(pred) = key_filter {
+                        if !pred(&key) {
+                            let rem = length - (probe_len as u64);
+                            reader.seek(SeekFrom::Current(rem as i64 + 4))?;
+                            continue;
+                        }
+                    }
+
+                    reader.seek(SeekFrom::Current(-(probe_len as i64)))?;
+                    let mut data = vec![0u8; length as usize];
+                    reader.read_exact(&mut data)?;
                     let val = String::from_utf8_lossy(&data[pos + 1..]).to_string();
                     entries.push(MetadataEntry { key, value: val });
+                } else {
+                    let rem = length - (probe_len as u64);
+                    reader.seek(SeekFrom::Current(rem as i64))?;
                 }
-                reader.seek(SeekFrom::Current(4))?;
+                reader.seek(SeekFrom::Current(4))?; // CRC
             }
 
             b"zTXt" => {
-                let mut data = vec![0u8; length as usize];
-                reader.read_exact(&mut data)?;
-                if let Some(pos) = data.iter().position(|&b| b == 0) {
-                    let key = String::from_utf8_lossy(&data[..pos]).to_string();
+                let probe_len = (length as usize).min(80);
+                let mut probe = vec![0u8; probe_len];
+                reader.read_exact(&mut probe)?;
+
+                if let Some(pos) = probe.iter().position(|&b| b == 0) {
+                    let key = String::from_utf8_lossy(&probe[..pos]).to_string();
+
+                    // Lazy check: skip compressed stream without decompressing
+                    if let Some(pred) = key_filter {
+                        if !pred(&key) {
+                            let rem = length - (probe_len as u64);
+                            reader.seek(SeekFrom::Current(rem as i64 + 4))?;
+                            continue;
+                        }
+                    }
+
+                    reader.seek(SeekFrom::Current(-(probe_len as i64)))?;
+                    let mut data = vec![0u8; length as usize];
+                    reader.read_exact(&mut data)?;
                     if pos + 2 <= data.len() {
                         if let Some(val) = decompress_zlib(&data[pos + 2..]) {
                             entries.push(MetadataEntry { key, value: val });
                         }
                     }
+                } else {
+                    let rem = length - (probe_len as u64);
+                    reader.seek(SeekFrom::Current(rem as i64))?;
                 }
-                reader.seek(SeekFrom::Current(4))?;
+                reader.seek(SeekFrom::Current(4))?; // CRC
             }
 
             b"iTXt" => {
-                let mut data = vec![0u8; length as usize];
-                reader.read_exact(&mut data)?;
-                if let Some(pos) = data.iter().position(|&b| b == 0) {
-                    let key = String::from_utf8_lossy(&data[..pos]).to_string();
+                let probe_len = (length as usize).min(80);
+                let mut probe = vec![0u8; probe_len];
+                reader.read_exact(&mut probe)?;
+
+                if let Some(pos) = probe.iter().position(|&b| b == 0) {
+                    let key = String::from_utf8_lossy(&probe[..pos]).to_string();
+
+                    // Lazy check: skip chunk if key is not needed
+                    if let Some(pred) = key_filter {
+                        if !pred(&key) {
+                            let rem = length - (probe_len as u64);
+                            reader.seek(SeekFrom::Current(rem as i64 + 4))?;
+                            continue;
+                        }
+                    }
+
+                    reader.seek(SeekFrom::Current(-(probe_len as i64)))?;
+                    let mut data = vec![0u8; length as usize];
+                    reader.read_exact(&mut data)?;
                     let rest = &data[pos + 1..];
                     if rest.len() >= 2 {
                         let comp_flag = rest[0];
@@ -171,8 +230,11 @@ pub fn extract_png_metadata<R: Read + Seek>(reader: &mut R) -> std::io::Result<V
                             }
                         }
                     }
+                } else {
+                    let rem = length - (probe_len as u64);
+                    reader.seek(SeekFrom::Current(rem as i64))?;
                 }
-                reader.seek(SeekFrom::Current(4))?;
+                reader.seek(SeekFrom::Current(4))?; // CRC
             }
 
             _ => {
@@ -246,28 +308,27 @@ mod tests {
     }
 
     #[test]
-    fn test_png_ztxt_compressed_chunk() {
+    fn test_png_lazy_decompression_skips_unwanted() {
         let mut png = PNG_MAGIC.to_vec();
-        let uncompressed_code = b"import matplotlib.pyplot as plt\ndef plot(): pass\n";
-        let compressed = compress_data(uncompressed_code);
-
+        let compressed = compress_data(b"huge_source_code_line_here");
         let mut payload = b"SourceCode\0\0".to_vec();
         payload.extend_from_slice(&compressed);
-
         png.extend_from_slice(&create_png_chunk(b"zTXt", &payload));
+
+        let mut shot_payload = b"Shot\0".to_vec();
+        shot_payload.extend_from_slice(b"92185");
+        png.extend_from_slice(&create_png_chunk(b"tEXt", &shot_payload));
         png.extend_from_slice(&create_png_chunk(b"IEND", &[]));
 
         let mut cursor = Cursor::new(png);
-        let entries = extract_png_metadata(&mut cursor).unwrap();
+        let filter = |k: &str| k == "Shot";
+        let entries = extract_png_metadata_filtered(&mut cursor, Some(&filter)).unwrap();
 
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key, "SourceCode");
-        assert_eq!(
-            entries[0].value,
-            "import matplotlib.pyplot as plt\ndef plot(): pass\n"
-        );
+        assert_eq!(entries[0].key, "Shot");
+        assert_eq!(entries[0].value, "92185");
     }
-
+    
     #[test]
     fn test_png_invalid_header_rejection() {
         let not_a_png = b"GIF89a\x01\x00\x01\x00...not a png";

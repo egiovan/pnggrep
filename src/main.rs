@@ -8,18 +8,24 @@ mod walker;
 use sanitize::sanitize_target;
 use std::env;
 use std::path::{Path, PathBuf};
-use walker::{cat_metadata, process_target, RunMode};
+use walker::{cat_metadata, cat_module, process_target, RunMode};
 
 fn print_help() {
     println!("pnggrep - Search, inspect, and sanitize embedded figure metadata\n");
     println!("USAGE:");
     println!("    pnggrep <PATTERN> [PATHS...] [OPTIONS]   Search pattern in figures or directories");
     println!("    pnggrep -l [-n LINES] [PATHS...]         List metadata across figures or directories");
+    println!("    pnggrep -p <PULSE> [PATHS...]            Unified fusion search (Shot, Shots, Pulse, Pulses)");
+    println!("    pnggrep -M [PATHS...]                    List local modules bundled in figures");
+    println!("    pnggrep --cat-module <NAME> <FILE>       Print source code of a bundled module");
     println!("    pnggrep --cat <KEY> <FILE>               Print raw value of a metadata key");
     println!("    pnggrep --sanitize [PATHS...]            Strip metadata and write <file>_sanitized.<ext>\n");
     println!("OPTIONS:");
     println!("    -l                          List metadata mode (no pattern required)");
     println!("    -n <LINES>                  Max lines to show per key in list mode [default: 3, 0=all]");
+    println!("    -p, --pulse <PULSE>         Unified fusion search across Shot, Shots, Pulse, Pulses");
+    println!("    -M, --modules               List bundled Python modules with names and line counts");
+    println!("        --cat-module <NAME>     Dump source code of a specific local module (1 file only)");
     println!("    -k, --key <SUBSTRING>       Filter metadata keys matching substring (case-insensitive)");
     println!("    -K, --keys-only             Show only matching metadata key names, omitting lines");
     println!("    -F, --files-only            Print only filenames of matching figures (no details)");
@@ -41,6 +47,9 @@ fn main() {
 
     let mut is_list = false;
     let mut is_sanitize = false;
+    let mut is_modules = false;
+    let mut pulse_query: Option<String> = None;
+    let mut cat_module_name: Option<String> = None;
     let mut max_lines = 3usize;
     let mut key_filter: Option<String> = None;
     let mut keys_only = false;
@@ -60,11 +69,32 @@ fn main() {
             "-l" => {
                 is_list = true;
             }
+            "-M" | "--modules" | "--list-modules" => {
+                is_modules = true;
+            }
             "--sanitize" => {
                 is_sanitize = true;
             }
             "--json" => {
                 is_json = true;
+            }
+            "-p" | "--pulse" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    pulse_query = Some(args[i].clone());
+                } else {
+                    eprintln!("Error: -p/--pulse requires a pulse or shot identifier.");
+                    std::process::exit(1);
+                }
+            }
+            "--cat-module" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    cat_module_name = Some(args[i].clone());
+                } else {
+                    eprintln!("Error: --cat-module requires a module name: pnggrep --cat-module <NAME> <FILE>");
+                    std::process::exit(1);
+                }
             }
             "-n" => {
                 if i + 1 < args.len() {
@@ -120,7 +150,22 @@ fn main() {
     }
 
     // -------------------------------------------------------------------------
-    // 1. --cat Mode (Strict single-file requirement)
+    // 1. --cat-module Mode (Strict single-file requirement)
+    // -------------------------------------------------------------------------
+    if let Some(mod_name) = cat_module_name {
+        if positional.len() != 1 {
+            eprintln!(
+                "Error: --cat-module requires exactly one target file: pnggrep --cat-module <NAME> <FILE>\nReceived {} path argument(s).",
+                positional.len()
+            );
+            std::process::exit(1);
+        }
+        cat_module(Path::new(&positional[0]), &mod_name);
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. --cat Mode (Strict single-file requirement)
     // -------------------------------------------------------------------------
     if let Some(key) = cat_key {
         if positional.len() != 1 {
@@ -135,7 +180,7 @@ fn main() {
     }
 
     // -------------------------------------------------------------------------
-    // 2. --sanitize Mode (Batch files/directories supported)
+    // 3. --sanitize Mode (Batch files/directories supported)
     // -------------------------------------------------------------------------
     if is_sanitize {
         let targets: Vec<PathBuf> = if positional.is_empty() {
@@ -151,7 +196,46 @@ fn main() {
     }
 
     // -------------------------------------------------------------------------
-    // 3. -l (List) Mode (Multiple files/directories supported)
+    // 4. -M / --modules Mode (List bundled modules across figures)
+    // -------------------------------------------------------------------------
+    if is_modules {
+        let targets: Vec<PathBuf> = if positional.is_empty() {
+            vec![PathBuf::from(".")]
+        } else {
+            positional.into_iter().map(PathBuf::from).collect()
+        };
+
+        let mode = RunMode::ListModules { json: is_json };
+        for target in &targets {
+            process_target(target, &mode, &custom_excludes);
+        }
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. -p / --pulse Mode (Unified fusion search across Shot/Pulse keys)
+    // -------------------------------------------------------------------------
+    if let Some(pulse) = pulse_query {
+        let targets: Vec<PathBuf> = if positional.is_empty() {
+            vec![PathBuf::from(".")]
+        } else {
+            positional.into_iter().map(PathBuf::from).collect()
+        };
+
+        let mode = RunMode::Pulse {
+            pulse,
+            files_only,
+            json: is_json,
+        };
+
+        for target in &targets {
+            process_target(target, &mode, &custom_excludes);
+        }
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // 6. -l (List) Mode (Multiple files/directories supported)
     // -------------------------------------------------------------------------
     if is_list {
         let targets: Vec<PathBuf> = if positional.is_empty() {
@@ -173,10 +257,10 @@ fn main() {
     }
 
     // -------------------------------------------------------------------------
-    // 4. Search Mode (Pattern + multiple files/directories supported)
+    // 7. General Search Mode (Pattern + multiple files/directories supported)
     // -------------------------------------------------------------------------
     if positional.is_empty() {
-        eprintln!("Error: Missing search pattern. Use -l to list all metadata.");
+        eprintln!("Error: Missing search pattern. Use -l to list all metadata, or -p for pulse search.");
         std::process::exit(1);
     }
 

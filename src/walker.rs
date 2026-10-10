@@ -1,6 +1,9 @@
-use crate::model::{resolve_key, MetadataEntry};
+use crate::model::{
+    find_local_modules, is_fusion_key, matches_fusion_pulse, normalize_key, resolve_key,
+    MetadataEntry,
+};
 use crate::pdf::extract_pdf_metadata;
-use crate::png::extract_png_metadata;
+use crate::png::extract_png_metadata_filtered;
 use crate::svg::extract_svg_metadata;
 use std::fs::{self, File};
 use std::io::BufReader;
@@ -31,9 +34,16 @@ pub enum RunMode {
         key_filter: Option<String>,
         json: bool,
     },
+    Pulse {
+        pulse: String,
+        files_only: bool,
+        json: bool,
+    },
+    ListModules {
+        json: bool,
+    },
 }
 
-/// Zero-dependency JSON string escaping (handles quotes, slashes, control characters)
 pub fn escape_json(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {
@@ -126,6 +136,13 @@ pub fn is_supported_ext(ext: &str) -> bool {
 }
 
 pub fn extract_metadata(path: &Path) -> std::io::Result<Vec<MetadataEntry>> {
+    extract_metadata_filtered(path, None)
+}
+
+pub fn extract_metadata_filtered(
+    path: &Path,
+    chunk_filter: Option<&dyn Fn(&str) -> bool>,
+) -> std::io::Result<Vec<MetadataEntry>> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -136,10 +153,150 @@ pub fn extract_metadata(path: &Path) -> std::io::Result<Vec<MetadataEntry>> {
     let mut reader = BufReader::new(file);
 
     match ext.as_str() {
-        "png" => extract_png_metadata(&mut reader),
+        "png" => extract_png_metadata_filtered(&mut reader, chunk_filter),
         "svg" => extract_svg_metadata(&mut reader),
         "pdf" => extract_pdf_metadata(&mut reader),
         _ => Ok(Vec::new()),
+    }
+}
+
+pub fn search_pulse_file(path: &Path, pulse: &str, files_only: bool, json: bool) {
+    let filter = |k: &str| is_fusion_key(k);
+    if let Ok(entries) = extract_metadata_filtered(path, Some(&filter)) {
+        let matched: Vec<&MetadataEntry> = entries
+            .iter()
+            .filter(|e| matches_fusion_pulse(&e.key, &e.value, pulse))
+            .collect();
+
+        if matched.is_empty() {
+            return;
+        }
+
+        if files_only {
+            println!("{}", path.display());
+            return;
+        }
+
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        if json {
+            let mut json_str = format!(
+                "{{\"path\":\"{}\",\"format\":\"{}\",\"matches\":[",
+                escape_json(&path.display().to_string()),
+                escape_json(&ext)
+            );
+            for (i, entry) in matched.iter().enumerate() {
+                if i > 0 {
+                    json_str.push(',');
+                }
+                json_str.push_str(&format!(
+                    "{{\"key\":\"{}\",\"value\":\"{}\"}}",
+                    escape_json(&entry.key),
+                    escape_json(&entry.value)
+                ));
+            }
+            json_str.push_str("]}");
+            println!("{}", json_str);
+            return;
+        }
+
+        println!("\x1b[1;35m{}\x1b[0m", path.display());
+        for entry in matched {
+            let clean_key = sanitize_for_terminal(&entry.key);
+            let clean_val = sanitize_for_terminal(&entry.value);
+            println!("  \x1b[36m{}\x1b[0m: \x1b[32m{}\x1b[0m", clean_key, clean_val);
+        }
+        println!();
+    }
+}
+
+pub fn list_modules_file(path: &Path, json: bool) {
+    let filter = |k: &str| {
+        let norm = normalize_key(k);
+        norm.ends_with("localmodules")
+    };
+    if let Ok(entries) = extract_metadata_filtered(path, Some(&filter)) {
+        let modules = find_local_modules(&entries);
+        if modules.is_empty() {
+            return;
+        }
+
+        if json {
+            let mut json_str = format!(
+                "{{\"path\":\"{}\",\"modules\":[",
+                escape_json(&path.display().to_string())
+            );
+            for (i, m) in modules.iter().enumerate() {
+                if i > 0 {
+                    json_str.push(',');
+                }
+                json_str.push_str(&format!(
+                    "{{\"name\":\"{}\",\"relpath\":\"{}\",\"lines\":{}}}",
+                    escape_json(&m.name),
+                    escape_json(&m.relpath),
+                    m.source_code.lines().count()
+                ));
+            }
+            json_str.push_str("]}");
+            println!("{}", json_str);
+        } else {
+            println!("\x1b[1;35m{}\x1b[0m", path.display());
+            for m in modules {
+                let line_count = m.source_code.lines().count();
+                if m.relpath.is_empty() {
+                    println!("  \x1b[36m{}\x1b[0m \x1b[90m({} lines)\x1b[0m", m.name, line_count);
+                } else {
+                    println!(
+                        "  \x1b[36m{}\x1b[0m \x1b[90m[{}]\x1b[0m \x1b[90m({} lines)\x1b[0m",
+                        m.name, m.relpath, line_count
+                    );
+                }
+            }
+            println!();
+        }
+    }
+}
+
+pub fn cat_module(file_path: &Path, module_name: &str) {
+    let filter = |k: &str| {
+        let norm = normalize_key(k);
+        norm.ends_with("localmodules")
+    };
+    let entries = match extract_metadata_filtered(file_path, Some(&filter)) {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("Error reading {}: {}", file_path.display(), err);
+            std::process::exit(1);
+        }
+    };
+
+    let modules = find_local_modules(&entries);
+    if modules.is_empty() {
+        eprintln!("No local modules found in {}", file_path.display());
+        std::process::exit(1);
+    }
+
+    if let Some(m) = modules.iter().find(|m| m.name.eq_ignore_ascii_case(module_name)) {
+        print!("{}", m.source_code);
+        if !m.source_code.ends_with('\n') {
+            println!();
+        }
+    } else {
+        let available: Vec<String> = modules
+            .iter()
+            .map(|m| format!("  - {} ({})", m.name, m.relpath))
+            .collect();
+        eprintln!(
+            "Module '{}' not found in {}. Available modules:\n{}",
+            module_name,
+            file_path.display(),
+            available.join("\n")
+        );
+        std::process::exit(1);
     }
 }
 
@@ -151,7 +308,14 @@ pub fn search_file(
     files_only: bool,
     json: bool,
 ) {
-    if let Ok(entries) = extract_metadata(path) {
+    let chunk_filter = key_filter.map(|kf| {
+        let kf_string = kf.to_lowercase();
+        move |k: &str| k.to_lowercase().contains(&kf_string)
+    });
+
+    let filter_ref = chunk_filter.as_ref().map(|f| f as &dyn Fn(&str) -> bool);
+
+    if let Ok(entries) = extract_metadata_filtered(path, filter_ref) {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -267,7 +431,14 @@ pub fn search_file(
 }
 
 pub fn list_file(path: &Path, max_lines: usize, key_filter: Option<&str>, json: bool) {
-    if let Ok(entries) = extract_metadata(path) {
+    let chunk_filter = key_filter.map(|kf| {
+        let kf_string = kf.to_lowercase();
+        move |k: &str| k.to_lowercase().contains(&kf_string)
+    });
+
+    let filter_ref = chunk_filter.as_ref().map(|f| f as &dyn Fn(&str) -> bool);
+
+    if let Ok(entries) = extract_metadata_filtered(path, filter_ref) {
         let filtered: Vec<MetadataEntry> = entries
             .into_iter()
             .filter(|e| {
@@ -357,7 +528,13 @@ pub fn list_file(path: &Path, max_lines: usize, key_filter: Option<&str>, json: 
 }
 
 pub fn cat_metadata(file_path: &Path, target_key: &str) {
-    let entries = match extract_metadata(file_path) {
+    let norm_target = normalize_key(target_key);
+    let filter = move |k: &str| {
+        let norm = normalize_key(k);
+        norm == norm_target || norm.ends_with(&norm_target)
+    };
+
+    let entries = match extract_metadata_filtered(file_path, Some(&filter)) {
         Ok(e) => e,
         Err(err) => {
             eprintln!("Error reading {}: {}", file_path.display(), err);
@@ -422,7 +599,6 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode, custom_excludes: &[String]) {
                     );
                     continue;
                 }
-
                 visit_dirs(&path, mode, custom_excludes);
             } else if path.is_file() {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -447,6 +623,12 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode, custom_excludes: &[String]) {
                                 key_filter,
                                 json,
                             } => list_file(&path, *max_lines, key_filter.as_deref(), *json),
+                            RunMode::Pulse {
+                                pulse,
+                                files_only,
+                                json,
+                            } => search_pulse_file(&path, pulse, *files_only, *json),
+                            RunMode::ListModules { json } => list_modules_file(&path, *json),
                         }
                     }
                 }
@@ -483,6 +665,16 @@ pub fn process_target(target: &Path, mode: &RunMode, custom_excludes: &[String])
                         json,
                     } => {
                         list_file(target, *max_lines, key_filter.as_deref(), *json);
+                    }
+                    RunMode::Pulse {
+                        pulse,
+                        files_only,
+                        json,
+                    } => {
+                        search_pulse_file(target, pulse, *files_only, *json);
+                    }
+                    RunMode::ListModules { json } => {
+                        list_modules_file(target, *json);
                     }
                 }
             } else {
