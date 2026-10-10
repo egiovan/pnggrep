@@ -8,12 +8,17 @@ runtime timestamp, Git commit SHA, Git commit message, execution provenance
 sys.path entries, fusion shot/pulse identifiers, local module dependencies,
 and database schemas into image metadata for PNG, SVG, and PDF formats.
 
+Applies automated heuristic rasterization for heavy datasets in vector formats
+(.pdf, .svg) to avoid visual artifacts and viewer lag, while keeping text,
+axes, and labels 100% vector.
+
 Default resolution: 300 DPI.
 
 Usage examples:
     savefig("equilibrium.png", shot=92185, database=df_plasma)
     savefig("comparison.pdf", shots=[92185, 92186], databases=[df_mhd, ds_equil])
     savefig("analysis.svg", pulse=92185, databases={"mhd": df_mhd}, modules=[ge, gp])
+    savefig("schematic.pdf", auto_rasterize=False)
 
 Alerts the user on stderr if saving from a dirty or untracked repository state.
 Guarantees immutability of system provenance keys against user metadata collisions.
@@ -38,6 +43,14 @@ from PIL import Image
 
 # Maximum memory allocation guard against oversized files during inspection
 MAX_FILE_READ_BYTES = 32 * 1024 * 1024  # 32 MB
+
+# Heuristic thresholds for automated artist rasterization in vector exports (.pdf, .svg)
+RASTERIZE_THRESHOLDS = {
+    "quadmesh_cells": 2000,
+    "scatter_points": 10000,
+    "line_points": 50000,
+    "poly_paths": 1000,
+}
 
 # Standard Dublin Core metadata elements accepted by Matplotlib's SVG backend
 PERMITTED_SVG_KEYS = {
@@ -177,6 +190,104 @@ def _get_execution_context() -> dict:
     }
 
 
+def _get_all_axes(fig) -> list:
+    """
+    Recursively collect all axes from a figure and any subfigures.
+    Deduplicates axes while preserving original display order.
+    """
+    axes = list(getattr(fig, "axes", []))
+
+    # Child subfigures created via fig.subfigures(...) are stored in `fig.subfigs`
+    subfigs = getattr(fig, "subfigs", [])
+    if isinstance(subfigs, (list, tuple)):
+        for subfig in subfigs:
+            axes.extend(_get_all_axes(subfig))
+
+    seen = set()
+    unique_axes = []
+    for ax in axes:
+        if ax not in seen:
+            seen.add(ax)
+            unique_axes.append(ax)
+    return unique_axes
+
+
+def _apply_auto_rasterization(fig) -> list:
+    """
+    Inspect all axes and subplots in the figure. If any artist exceeds complexity
+    thresholds for vector rendering, mark it as rasterized for export.
+    Returns a list of (artist, previous_rasterized_state) tuples to allow restoration.
+    """
+    modified = []
+    axes_list = _get_all_axes(fig)
+
+    for ax in axes_list:
+        # 1. Line plots (Line2D)
+        for line in getattr(ax, "get_lines", lambda: [])():
+            if not line.get_rasterized():
+                try:
+                    xdata = line.get_xdata(orig=False)
+                    n_pts = len(xdata) if xdata is not None else 0
+                    if n_pts >= RASTERIZE_THRESHOLDS["line_points"]:
+                        modified.append((line, line.get_rasterized()))
+                        line.set_rasterized(True)
+                        sys.stderr.write(
+                            f"\x1b[36m[smart_savefig]\x1b[0m Auto-rasterized Line2D ({n_pts:,} points) for vector export.\n"
+                        )
+                except Exception:
+                    pass
+
+        # 2. Artist collections (pcolormesh, scatter, contourf, fill_between)
+        for coll in getattr(ax, "collections", []):
+            if coll.get_rasterized():
+                continue
+            coll_type = coll.__class__.__name__
+
+            # QuadMesh (plt.pcolormesh)
+            if coll_type == "QuadMesh" or hasattr(coll, "get_coordinates"):
+                try:
+                    arr = coll.get_array()
+                    n_cells = getattr(arr, "size", len(arr)) if arr is not None else 0
+                    if n_cells >= RASTERIZE_THRESHOLDS["quadmesh_cells"]:
+                        modified.append((coll, coll.get_rasterized()))
+                        coll.set_rasterized(True)
+                        sys.stderr.write(
+                            f"\x1b[36m[smart_savefig]\x1b[0m Auto-rasterized QuadMesh ({n_cells:,} cells) to eliminate vector grid lines and file bloat.\n"
+                        )
+                except Exception:
+                    pass
+
+            # PathCollection (plt.scatter)
+            elif coll_type == "PathCollection" or hasattr(coll, "get_offsets"):
+                try:
+                    offsets = coll.get_offsets()
+                    n_pts = len(offsets) if offsets is not None else 0
+                    if n_pts >= RASTERIZE_THRESHOLDS["scatter_points"]:
+                        modified.append((coll, coll.get_rasterized()))
+                        coll.set_rasterized(True)
+                        sys.stderr.write(
+                            f"\x1b[36m[smart_savefig]\x1b[0m Auto-rasterized PathCollection/scatter ({n_pts:,} points) for vector export.\n"
+                        )
+                except Exception:
+                    pass
+
+            # PolyCollection (plt.contourf, plt.tripcolor, plt.fill_between)
+            elif coll_type == "PolyCollection" or hasattr(coll, "get_paths"):
+                try:
+                    paths = coll.get_paths()
+                    n_paths = len(paths) if paths is not None else 0
+                    if n_paths >= RASTERIZE_THRESHOLDS["poly_paths"]:
+                        modified.append((coll, coll.get_rasterized()))
+                        coll.set_rasterized(True)
+                        sys.stderr.write(
+                            f"\x1b[36m[smart_savefig]\x1b[0m Auto-rasterized PolyCollection ({n_paths:,} paths) for vector export.\n"
+                        )
+                except Exception:
+                    pass
+
+    return modified
+
+
 def _extract_figure_semantics(fig) -> dict:
     """
     Inspect the figure to extract plot titles, axis labels, and legend entries.
@@ -199,8 +310,8 @@ def _extract_figure_semantics(fig) -> dict:
     except Exception:
         pass
 
-    # 2. Iterate over all axes (including subplots, twinned axes, colorbars)
-    for ax in getattr(fig, "axes", []):
+    # 2. Iterate over all axes (including subplots, twinned axes, colorbars, subfigures)
+    for ax in _get_all_axes(fig):
         try:
             # Axis title
             t = ax.get_title()
@@ -707,6 +818,7 @@ def savefig(
     database=None,
     databases=None,
     dpi=300,
+    auto_rasterize=True,
     **kwargs,
 ):
     """
@@ -726,6 +838,9 @@ def savefig(
         database: Single database/table (DataFrame, Dataset, file path, dict).
         databases: Sequence or dict of databases/tables.
         dpi: Resolution in dots per inch [default: 300].
+        auto_rasterize: Automatically set rasterized=True on complex artists
+                        (QuadMesh, dense scatter, high-frequency line plots)
+                        when exporting to vector formats (.pdf, .svg) [default: True].
         **kwargs: Extra keyword arguments forwarded to matplotlib.pyplot.savefig.
     """
     if fig is None:
@@ -746,6 +861,8 @@ def savefig(
         database = kwargs.pop("database", None)
     if databases is None:
         databases = kwargs.pop("databases", None)
+    if "auto_rasterize" in kwargs:
+        auto_rasterize = kwargs.pop("auto_rasterize")
 
     ext = Path(fname).suffix.lower()
     ctx = _get_caller_context(explicit_modules=modules)
@@ -784,130 +901,144 @@ def savefig(
             f"  \x1b[90m-> Consider committing your changes for strict reproducibility.\x1b[0m\n\n"
         )
 
-    # -------------------------------------------------------------------------
-    # 1. PNG Backend
-    # -------------------------------------------------------------------------
-    if ext == ".png":
-        # Safe user metadata populated first
-        meta = {str(k): str(v) for k, v in user_metadata.items()}
+    # 4. Apply automated heuristic rasterization for vector formats (.pdf, .svg, .eps)
+    rasterized_artists = []
+    if ext in [".pdf", ".svg", ".eps"] and auto_rasterize:
+        rasterized_artists = _apply_auto_rasterization(fig)
 
-        # Authoritative system metadata overwrites to guarantee provenance
-        meta.update({
-            "SourceDirectory": ctx["directory"],
-            "SourceFile": ctx["filename"],
-            "SourcePath": ctx["filepath"],
-            "CallerFunction": ctx["caller_function"],
-            "Timestamp": ctx["timestamp"],
-            "PythonVersion": ctx["python_version"],
-            "Hostname": ctx["hostname"],
-            "Username": ctx["username"],
-            "Command": ctx["command"],
-            "SourceCode": ctx["source_code"],
-            "Comment": ctx["source_code"],
-            "Description": f"Generated by {ctx['filename']} ({ctx['caller_function']})",
-            "SysPath": ctx["sys_path"],
-        })
+    try:
+        # -------------------------------------------------------------------------
+        # 1. PNG Backend
+        # -------------------------------------------------------------------------
+        if ext == ".png":
+            # Safe user metadata populated first
+            meta = {str(k): str(v) for k, v in user_metadata.items()}
 
-        # Only embed LocalModules if modules were explicitly requested and found
-        if ctx["local_modules"]:
-            meta["LocalModules"] = ctx["local_modules"]
+            # Authoritative system metadata overwrites to guarantee provenance
+            meta.update({
+                "SourceDirectory": ctx["directory"],
+                "SourceFile": ctx["filename"],
+                "SourcePath": ctx["filepath"],
+                "CallerFunction": ctx["caller_function"],
+                "Timestamp": ctx["timestamp"],
+                "PythonVersion": ctx["python_version"],
+                "Hostname": ctx["hostname"],
+                "Username": ctx["username"],
+                "Command": ctx["command"],
+                "SourceCode": ctx["source_code"],
+                "Comment": ctx["source_code"],
+                "Description": f"Generated by {ctx['filename']} ({ctx['caller_function']})",
+                "SysPath": ctx["sys_path"],
+            })
 
-        # Embed semantics as clean newline-delimited chunks
-        if semantics["titles"]:
-            meta["PlotTitles"] = "\n".join(semantics["titles"])
-        if semantics["axis_labels"]:
-            meta["AxisLabels"] = "\n".join(semantics["axis_labels"])
-        if semantics["legends"]:
-            meta["LegendLabels"] = "\n".join(semantics["legends"])
+            # Only embed LocalModules if modules were explicitly requested and found
+            if ctx["local_modules"]:
+                meta["LocalModules"] = ctx["local_modules"]
 
-        # Embed fusion keys as standalone PNG chunks
-        if "shot" in fusion_ctx:
-            meta["Shot"] = str(fusion_ctx["shot"])
-        if "shots" in fusion_ctx:
-            meta["Shots"] = json.dumps(fusion_ctx["shots"])
-        if "pulse" in fusion_ctx:
-            meta["Pulse"] = str(fusion_ctx["pulse"])
-        if "pulses" in fusion_ctx:
-            meta["Pulses"] = json.dumps(fusion_ctx["pulses"])
+            # Embed semantics as clean newline-delimited chunks
+            if semantics["titles"]:
+                meta["PlotTitles"] = "\n".join(semantics["titles"])
+            if semantics["axis_labels"]:
+                meta["AxisLabels"] = "\n".join(semantics["axis_labels"])
+            if semantics["legends"]:
+                meta["LegendLabels"] = "\n".join(semantics["legends"])
 
-        # Embed database schemas as line-delimited stream
-        if db_schemas:
-            meta["Databases"] = _format_databases_text(db_schemas)
+            # Embed fusion keys as standalone PNG chunks
+            if "shot" in fusion_ctx:
+                meta["Shot"] = str(fusion_ctx["shot"])
+            if "shots" in fusion_ctx:
+                meta["Shots"] = json.dumps(fusion_ctx["shots"])
+            if "pulse" in fusion_ctx:
+                meta["Pulse"] = str(fusion_ctx["pulse"])
+            if "pulses" in fusion_ctx:
+                meta["Pulses"] = json.dumps(fusion_ctx["pulses"])
 
-        if "git_commit" in ctx:
-            meta["GitCommit"] = ctx["git_commit"]
-            meta["GitCommitMessage"] = ctx.get("git_commit_message", "")
-            meta["GitDirty"] = str(ctx["git_dirty"])
-            meta["GitScriptTracked"] = str(ctx.get("git_script_tracked", False))
+            # Embed database schemas as line-delimited stream
+            if db_schemas:
+                meta["Databases"] = _format_databases_text(db_schemas)
 
-        fig.savefig(fname, metadata=meta, dpi=dpi, **kwargs)
+            if "git_commit" in ctx:
+                meta["GitCommit"] = ctx["git_commit"]
+                meta["GitCommitMessage"] = ctx.get("git_commit_message", "")
+                meta["GitDirty"] = str(ctx["git_dirty"])
+                meta["GitScriptTracked"] = str(ctx.get("git_script_tracked", False))
 
-    # -------------------------------------------------------------------------
-    # 2. SVG Backend (Dublin Core validation)
-    # -------------------------------------------------------------------------
-    elif ext == ".svg":
-        svg_title = semantics["titles"][0] if semantics["titles"] else ctx["filename"]
-        svg_meta = {
-            "Title": svg_title,
-            "Date": ctx["timestamp"],
-            "Type": "Scientific Visualization",
-        }
+            fig.savefig(fname, metadata=meta, dpi=dpi, **kwargs)
 
-        custom_json_metadata = {}
-        for key, val in user_metadata.items():
-            key_lower = str(key).strip().lower()
-            if key_lower in PERMITTED_SVG_KEYS and key_lower != "description":
-                canonical_key = CANONICAL_SVG_KEYS[key_lower]
-                svg_meta[canonical_key] = str(val)
-            else:
-                custom_json_metadata[key] = val
+        # -------------------------------------------------------------------------
+        # 2. SVG Backend (Dublin Core validation)
+        # -------------------------------------------------------------------------
+        elif ext == ".svg":
+            svg_title = semantics["titles"][0] if semantics["titles"] else ctx["filename"]
+            svg_meta = {
+                "Title": svg_title,
+                "Date": ctx["timestamp"],
+                "Type": "Scientific Visualization",
+            }
 
-        # System provenance strictly overrides user values
-        final_ctx = {**custom_json_metadata, **ctx}
-        if not final_ctx.get("local_modules"):
-            final_ctx.pop("local_modules", None)
+            custom_json_metadata = {}
+            for key, val in user_metadata.items():
+                key_lower = str(key).strip().lower()
+                if key_lower in PERMITTED_SVG_KEYS and key_lower != "description":
+                    canonical_key = CANONICAL_SVG_KEYS[key_lower]
+                    svg_meta[canonical_key] = str(val)
+                else:
+                    custom_json_metadata[key] = val
 
-        payload = json.dumps(final_ctx, indent=2, ensure_ascii=False, default=str)
-        svg_meta["Description"] = payload
+            # System provenance strictly overrides user values
+            final_ctx = {**custom_json_metadata, **ctx}
+            if not final_ctx.get("local_modules"):
+                final_ctx.pop("local_modules", None)
 
-        fig.savefig(fname, metadata=svg_meta, dpi=dpi, **kwargs)
+            payload = json.dumps(final_ctx, indent=2, ensure_ascii=False, default=str)
+            svg_meta["Description"] = payload
 
-    # -------------------------------------------------------------------------
-    # 3. PDF Backend (PDF /Info dictionary validation)
-    # -------------------------------------------------------------------------
-    elif ext == ".pdf":
-        pdf_title = semantics["titles"][0] if semantics["titles"] else ctx["filename"]
-        native_pdf_meta = {
-            "Title": str(user_metadata.get("Title", pdf_title)),
-            "Author": str(user_metadata.get("Author", ctx["username"])),
-            "Subject": str(user_metadata.get("Subject", f"smart_savefig: {ctx['filename']}")),
-            "Creator": f"matplotlib {matplotlib.__version__} (smart_savefig)",
-        }
+            fig.savefig(fname, metadata=svg_meta, dpi=dpi, **kwargs)
 
-        custom_json_metadata = {}
-        for key, val in user_metadata.items():
-            key_lower = str(key).strip().lower()
-            if key_lower in PERMITTED_PDF_KEYS and key_lower != "keywords":
-                canonical_key = CANONICAL_PDF_KEYS[key_lower]
-                native_pdf_meta[canonical_key] = str(val)
-            else:
-                custom_json_metadata[key] = val
+        # -------------------------------------------------------------------------
+        # 3. PDF Backend (PDF /Info dictionary validation)
+        # -------------------------------------------------------------------------
+        elif ext == ".pdf":
+            pdf_title = semantics["titles"][0] if semantics["titles"] else ctx["filename"]
+            native_pdf_meta = {
+                "Title": str(user_metadata.get("Title", pdf_title)),
+                "Author": str(user_metadata.get("Author", ctx["username"])),
+                "Subject": str(user_metadata.get("Subject", f"smart_savefig: {ctx['filename']}")),
+                "Creator": f"matplotlib {matplotlib.__version__} (smart_savefig)",
+            }
 
-        # System provenance strictly overrides user values
-        final_ctx = {**custom_json_metadata, **ctx}
-        if not final_ctx.get("local_modules"):
-            final_ctx.pop("local_modules", None)
+            custom_json_metadata = {}
+            for key, val in user_metadata.items():
+                key_lower = str(key).strip().lower()
+                if key_lower in PERMITTED_PDF_KEYS and key_lower != "keywords":
+                    canonical_key = CANONICAL_PDF_KEYS[key_lower]
+                    native_pdf_meta[canonical_key] = str(val)
+                else:
+                    custom_json_metadata[key] = val
 
-        payload = json.dumps(final_ctx, indent=2, ensure_ascii=False, default=str)
-        native_pdf_meta["Keywords"] = payload
+            # System provenance strictly overrides user values
+            final_ctx = {**custom_json_metadata, **ctx}
+            if not final_ctx.get("local_modules"):
+                final_ctx.pop("local_modules", None)
 
-        fig.savefig(fname, metadata=native_pdf_meta, dpi=dpi, **kwargs)
+            payload = json.dumps(final_ctx, indent=2, ensure_ascii=False, default=str)
+            native_pdf_meta["Keywords"] = payload
 
-    # -------------------------------------------------------------------------
-    # 4. Other Backends
-    # -------------------------------------------------------------------------
-    else:
-        fig.savefig(fname, dpi=dpi, **kwargs)
+            fig.savefig(fname, metadata=native_pdf_meta, dpi=dpi, **kwargs)
+
+        # -------------------------------------------------------------------------
+        # 4. Other Backends
+        # -------------------------------------------------------------------------
+        else:
+            fig.savefig(fname, dpi=dpi, **kwargs)
+
+    finally:
+        # Revert in-memory artists to their previous state to prevent unintended side effects
+        for artist, prev_state in rasterized_artists:
+            try:
+                artist.set_rasterized(prev_state)
+            except Exception:
+                pass
 
 
 def read_metadata(image_path: str) -> dict:
