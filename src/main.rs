@@ -37,6 +37,7 @@ fn print_help() {
     println!("    --sanitize                  Strip sensitive metadata and create _sanitized files");
     println!("    -s, --skip, --exclude <DIR> Skip specific directory during traversal (repeatable)");
     println!("    --cat, -cat <KEY>           Dump exact value without formatting (1 file only)");
+    println!("    -V, --version               Print version information");
     println!("    -h, --help                  Show help information");
 }
 
@@ -66,6 +67,10 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "-V" | "--version" => {
+                println!("pnggrep {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
             "-h" | "--help" => {
                 print_help();
                 return;

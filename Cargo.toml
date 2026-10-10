@@ -1,6 +1,6 @@
 [package]
 name = "pnggrep"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Edmondo Giovannozzi <edmondo.giovannozzi@enea.it>"]
 edition = "2018"
 description = "Fast, zero-dependency CLI tool to search and inspect metadata in PNG and SVG figures"
