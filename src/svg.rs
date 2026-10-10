@@ -62,6 +62,119 @@ pub fn xml_unescape(input: &str) -> String {
     out
 }
 
+enum JsonArrayValue {
+    Primitive(String),
+    Object(Vec<(String, String)>),
+}
+
+fn parse_json_array(chars: &[char], depth: usize) -> Option<Vec<JsonArrayValue>> {
+    let n = chars.len();
+    if n < 2 || chars[0] != '[' || chars[n - 1] != ']' {
+        return None;
+    }
+
+    let mut items = Vec::new();
+    let mut idx = 1;
+
+    while idx < n - 1 {
+        while idx < n - 1 && (chars[idx].is_whitespace() || chars[idx] == ',') {
+            idx += 1;
+        }
+        if idx >= n - 1 {
+            break;
+        }
+
+        if chars[idx] == '"' {
+            idx += 1;
+            let mut val = String::new();
+            while idx < n && chars[idx] != '"' {
+                if chars[idx] == '\\' && idx + 1 < n {
+                    idx += 1;
+                    match chars[idx] {
+                        '"' => val.push('"'),
+                        '\\' => val.push('\\'),
+                        '/' => val.push('/'),
+                        'n' => val.push('\n'),
+                        'r' => val.push('\r'),
+                        't' => val.push('\t'),
+                        'u' if idx + 4 < n => {
+                            let hex_str: String = chars[idx + 1..=idx + 4].iter().collect();
+                            if let Ok(code) = u32::from_str_radix(&hex_str, 16) {
+                                if let Some(ch) = std::char::from_u32(code) {
+                                    val.push(ch);
+                                }
+                            }
+                            idx += 4;
+                        }
+                        _ => val.push(chars[idx]),
+                    }
+                } else {
+                    val.push(chars[idx]);
+                }
+                idx += 1;
+            }
+            if idx < n {
+                idx += 1;
+            }
+            items.push(JsonArrayValue::Primitive(val));
+        } else if chars[idx] == '{' {
+            let start_obj = idx;
+            let mut obj_depth = 0;
+            let mut in_str = false;
+            while idx < n {
+                if chars[idx] == '"' && (idx == 0 || chars[idx - 1] != '\\') {
+                    in_str = !in_str;
+                } else if !in_str {
+                    if chars[idx] == '{' {
+                        obj_depth += 1;
+                    } else if chars[idx] == '}' {
+                        obj_depth -= 1;
+                        if obj_depth == 0 {
+                            idx += 1;
+                            break;
+                        }
+                    }
+                }
+                idx += 1;
+            }
+            let obj_str: String = chars[start_obj..idx].iter().collect();
+            let sub_entries = parse_json_object(&obj_str, depth + 1)?;
+            items.push(JsonArrayValue::Object(sub_entries));
+        } else if chars[idx] == '[' {
+            let start_sub = idx;
+            let mut sub_depth = 0;
+            let mut in_str = false;
+            while idx < n {
+                if chars[idx] == '"' && (idx == 0 || chars[idx - 1] != '\\') {
+                    in_str = !in_str;
+                } else if !in_str {
+                    if chars[idx] == '[' {
+                        sub_depth += 1;
+                    } else if chars[idx] == ']' {
+                        sub_depth -= 1;
+                        if sub_depth == 0 {
+                            idx += 1;
+                            break;
+                        }
+                    }
+                }
+                idx += 1;
+            }
+            let sub_str: String = chars[start_sub..idx].iter().collect();
+            items.push(JsonArrayValue::Primitive(sub_str));
+        } else {
+            let start_val = idx;
+            while idx < n - 1 && chars[idx] != ',' && chars[idx] != ']' && !chars[idx].is_whitespace() {
+                idx += 1;
+            }
+            let val_str: String = chars[start_val..idx].iter().collect();
+            items.push(JsonArrayValue::Primitive(val_str));
+        }
+    }
+
+    Some(items)
+}
+
 pub fn parse_json_object(input: &str, depth: usize) -> Option<Vec<(String, String)>> {
     if depth > MAX_JSON_RECURSION_DEPTH {
         return None;
@@ -183,6 +296,56 @@ pub fn parse_json_object(input: &str, depth: usize) -> Option<Vec<(String, Strin
             let sub_entries = parse_json_object(&obj_str, depth + 1)?;
             for (sub_k, sub_v) in sub_entries {
                 results.push((format!("{}/{}", key, sub_k), sub_v));
+            }
+        } else if chars[i] == '[' {
+            let start_arr = i;
+            let mut arr_depth = 0;
+            let mut in_str = false;
+            while i < n {
+                if chars[i] == '"' && (i == 0 || chars[i - 1] != '\\') {
+                    in_str = !in_str;
+                } else if !in_str {
+                    if chars[i] == '[' {
+                        arr_depth += 1;
+                    } else if chars[i] == ']' {
+                        arr_depth -= 1;
+                        if arr_depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                i += 1;
+            }
+            let arr_chars = &chars[start_arr..i];
+            if let Some(items) = parse_json_array(arr_chars, depth + 1) {
+                let has_objects = items.iter().any(|it| matches!(it, JsonArrayValue::Object(_)));
+                if has_objects {
+                    for (idx, it) in items.into_iter().enumerate() {
+                        match it {
+                            JsonArrayValue::Object(entries) => {
+                                for (sub_k, sub_v) in entries {
+                                    results.push((format!("{}/{}/{}", key, idx, sub_k), sub_v));
+                                }
+                            }
+                            JsonArrayValue::Primitive(p) => {
+                                results.push((format!("{}/{}", key, idx), p));
+                            }
+                        }
+                    }
+                } else {
+                    let lines: Vec<String> = items
+                        .into_iter()
+                        .map(|it| match it {
+                            JsonArrayValue::Primitive(p) => p,
+                            _ => String::new(),
+                        })
+                        .collect();
+                    results.push((key, lines.join("\n")));
+                }
+            } else {
+                let arr_str: String = arr_chars.iter().collect();
+                results.push((key, arr_str));
             }
         } else {
             let start_val = i;
@@ -377,6 +540,33 @@ mod tests {
         assert_eq!(
             resolve_key(&entries, "SourceCode").unwrap().value,
             "import numpy as np\ndef solve(): pass\n"
+        );
+    }
+
+    #[test]
+    fn test_svg_metadata_with_json_arrays() {
+        let svg_data = r#"<svg xmlns="http://www.w3.org/2000/svg">
+  <metadata>
+    <dc:description>{
+      &quot;directory&quot;: &quot;/sim&quot;,
+      &quot;argv&quot;: [&quot;run.py&quot;, &quot;--shot&quot;, &quot;92185&quot;],
+      &quot;semantics&quot;: {
+        &quot;labels&quot;: [&quot;rho&quot;, &quot;shear&quot;]
+      }
+    }</dc:description>
+  </metadata>
+</svg>"#;
+        let mut cursor = Cursor::new(svg_data.as_bytes());
+        let entries = extract_svg_metadata(&mut cursor).unwrap();
+
+        assert_eq!(resolve_key(&entries, "Description/directory").unwrap().value, "/sim");
+        assert_eq!(
+            resolve_key(&entries, "Description/argv").unwrap().value,
+            "run.py\n--shot\n92185"
+        );
+        assert_eq!(
+            resolve_key(&entries, "Description/semantics/labels").unwrap().value,
+            "rho\nshear"
         );
     }
 
