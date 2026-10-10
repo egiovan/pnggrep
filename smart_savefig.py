@@ -48,7 +48,6 @@ MAX_FILE_READ_BYTES = 32 * 1024 * 1024  # 32 MB
 RASTERIZE_THRESHOLDS = {
     "quadmesh_cells": 2000,
     "scatter_points": 10000,
-    "line_points": 50000,
     "poly_paths": 1000,
 }
 
@@ -214,30 +213,16 @@ def _get_all_axes(fig) -> list:
 
 def _apply_auto_rasterization(fig) -> list:
     """
-    Inspect all axes and subplots in the figure. If any artist exceeds complexity
-    thresholds for vector rendering, mark it as rasterized for export.
-    Returns a list of (artist, previous_rasterized_state) tuples to allow restoration.
+    Inspect all axes in the figure. If collection artists (QuadMesh, scatter,
+    contourf) exceed complexity thresholds, mark them as rasterized for export.
+    Line2D plots are left as pure vector because Matplotlib simplifies them
+    automatically via path.simplify.
     """
     modified = []
     axes_list = _get_all_axes(fig)
 
     for ax in axes_list:
-        # 1. Line plots (Line2D)
-        for line in getattr(ax, "get_lines", lambda: [])():
-            if not line.get_rasterized():
-                try:
-                    xdata = line.get_xdata(orig=False)
-                    n_pts = len(xdata) if xdata is not None else 0
-                    if n_pts >= RASTERIZE_THRESHOLDS["line_points"]:
-                        modified.append((line, line.get_rasterized()))
-                        line.set_rasterized(True)
-                        sys.stderr.write(
-                            f"\x1b[36m[smart_savefig]\x1b[0m Auto-rasterized Line2D ({n_pts:,} points) for vector export.\n"
-                        )
-                except Exception:
-                    pass
-
-        # 2. Artist collections (pcolormesh, scatter, contourf, fill_between)
+        # Artist collections (pcolormesh, scatter, contourf, fill_between)
         for coll in getattr(ax, "collections", []):
             if coll.get_rasterized():
                 continue
@@ -252,7 +237,8 @@ def _apply_auto_rasterization(fig) -> list:
                         modified.append((coll, coll.get_rasterized()))
                         coll.set_rasterized(True)
                         sys.stderr.write(
-                            f"\x1b[36m[smart_savefig]\x1b[0m Auto-rasterized QuadMesh ({n_cells:,} cells) to eliminate vector grid lines and file bloat.\n"
+                            f"\x1b[36m[smart_savefig]\x1b[0m Auto-rasterized QuadMesh ({n_cells:,} cells) "
+                            f"to eliminate vector grid lines and file bloat.\n"
                         )
                 except Exception:
                     pass
@@ -266,7 +252,8 @@ def _apply_auto_rasterization(fig) -> list:
                         modified.append((coll, coll.get_rasterized()))
                         coll.set_rasterized(True)
                         sys.stderr.write(
-                            f"\x1b[36m[smart_savefig]\x1b[0m Auto-rasterized PathCollection/scatter ({n_pts:,} points) for vector export.\n"
+                            f"\x1b[36m[smart_savefig]\x1b[0m Auto-rasterized PathCollection/scatter ({n_pts:,} points) "
+                            f"for vector export.\n"
                         )
                 except Exception:
                     pass
@@ -280,7 +267,8 @@ def _apply_auto_rasterization(fig) -> list:
                         modified.append((coll, coll.get_rasterized()))
                         coll.set_rasterized(True)
                         sys.stderr.write(
-                            f"\x1b[36m[smart_savefig]\x1b[0m Auto-rasterized PolyCollection ({n_paths:,} paths) for vector export.\n"
+                            f"\x1b[36m[smart_savefig]\x1b[0m Auto-rasterized PolyCollection ({n_paths:,} paths) "
+                            f"for vector export.\n"
                         )
                 except Exception:
                     pass
