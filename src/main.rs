@@ -8,7 +8,7 @@ mod walker;
 use sanitize::sanitize_target;
 use std::env;
 use std::path::{Path, PathBuf};
-use walker::{cat_metadata, cat_module, process_target, RunMode};
+use walker::{cat_metadata, cat_module, process_target, DateFilter, RunMode};
 
 fn print_help() {
     println!("pnggrep - Search, inspect, and sanitize embedded figure metadata\n");
@@ -26,6 +26,8 @@ fn print_help() {
     println!("    -p, --pulse <PULSE>         Unified fusion search across Shot, Shots, Pulse, Pulses");
     println!("    -M, --modules               List bundled Python modules with names and line counts");
     println!("        --cat-module <NAME>     Dump source code of a specific local module (1 file only)");
+    println!("        --after, --since <DATE> Match figures on or after date (YYYY, YYYY-MM, YYYY-MM-DD, ISO, 2d)");
+    println!("        --before, --until <DATE> Match figures on or before date (YYYY, YYYY-MM, YYYY-MM-DD, ISO, 2d)");
     println!("    -k, --key <SUBSTRING>       Filter metadata keys matching substring (case-insensitive)");
     println!("    -K, --keys-only             Show only matching metadata key names, omitting lines");
     println!("    -F, --files-only            Print only filenames of matching figures (no details)");
@@ -50,6 +52,8 @@ fn main() {
     let mut is_modules = false;
     let mut pulse_query: Option<String> = None;
     let mut cat_module_name: Option<String> = None;
+    let mut after_arg: Option<String> = None;
+    let mut before_arg: Option<String> = None;
     let mut max_lines = 3usize;
     let mut key_filter: Option<String> = None;
     let mut keys_only = false;
@@ -93,6 +97,24 @@ fn main() {
                     cat_module_name = Some(args[i].clone());
                 } else {
                     eprintln!("Error: --cat-module requires a module name: pnggrep --cat-module <NAME> <FILE>");
+                    std::process::exit(1);
+                }
+            }
+            "--after" | "--since" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    after_arg = Some(args[i].clone());
+                } else {
+                    eprintln!("Error: {} requires a date or duration (e.g. 2026, 2026-10, 2026-10-01, 2d).", args[i]);
+                    std::process::exit(1);
+                }
+            }
+            "--before" | "--until" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    before_arg = Some(args[i].clone());
+                } else {
+                    eprintln!("Error: {} requires a date or duration (e.g. 2026, 2026-10, 2026-10-01, 2d).", args[i]);
                     std::process::exit(1);
                 }
             }
@@ -148,6 +170,38 @@ fn main() {
         }
         i += 1;
     }
+
+    // -------------------------------------------------------------------------
+    // Date Filter Parsing
+    // -------------------------------------------------------------------------
+    let after_epoch = if let Some(ref a) = after_arg {
+        match model::parse_date_bound(a, false) {
+            Ok(epoch) => Some(epoch),
+            Err(e) => {
+                eprintln!("Error parsing --after/--since '{}': {}", a, e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    let before_epoch = if let Some(ref b) = before_arg {
+        match model::parse_date_bound(b, true) {
+            Ok(epoch) => Some(epoch),
+            Err(e) => {
+                eprintln!("Error parsing --before/--until '{}': {}", b, e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    let date_filter = DateFilter {
+        after: after_epoch,
+        before: before_epoch,
+    };
 
     // -------------------------------------------------------------------------
     // 1. --cat-module Mode (Strict single-file requirement)
@@ -224,6 +278,7 @@ fn main() {
 
         let mode = RunMode::Pulse {
             pulse,
+            date_filter,
             files_only,
             json: is_json,
         };
@@ -247,6 +302,7 @@ fn main() {
         let mode = RunMode::List {
             max_lines,
             key_filter,
+            date_filter,
             json: is_json,
         };
 
@@ -274,6 +330,7 @@ fn main() {
     let mode = RunMode::Search {
         pattern,
         key_filter,
+        date_filter,
         keys_only,
         files_only,
         json: is_json,

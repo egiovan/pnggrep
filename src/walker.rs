@@ -1,6 +1,6 @@
 use crate::model::{
-    find_local_modules, is_fusion_key, matches_fusion_pulse, normalize_key, resolve_key,
-    MetadataEntry,
+    extract_entry_timestamp, find_local_modules, is_date_key, is_fusion_key,
+    matches_fusion_pulse, normalize_key, resolve_key, MetadataEntry,
 };
 use crate::pdf::extract_pdf_metadata;
 use crate::png::extract_png_metadata_filtered;
@@ -31,11 +31,38 @@ pub const SILENT_IGNORED_DIRS: &[&str] = &[
     ".singularity", ".apptainer", ".docker", ".spack",
 ];
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DateFilter {
+    pub after: Option<u64>,
+    pub before: Option<u64>,
+}
+
+impl DateFilter {
+    pub fn is_active(&self) -> bool {
+        self.after.is_some() || self.before.is_some()
+    }
+
+    pub fn matches(&self, timestamp: u64) -> bool {
+        if let Some(after) = self.after {
+            if timestamp < after {
+                return false;
+            }
+        }
+        if let Some(before) = self.before {
+            if timestamp > before {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum RunMode {
     Search {
         pattern: String,
         key_filter: Option<String>,
+        date_filter: DateFilter,
         keys_only: bool,
         files_only: bool,
         json: bool,
@@ -43,10 +70,12 @@ pub enum RunMode {
     List {
         max_lines: usize,
         key_filter: Option<String>,
+        date_filter: DateFilter,
         json: bool,
     },
     Pulse {
         pulse: String,
+        date_filter: DateFilter,
         files_only: bool,
         json: bool,
     },
@@ -171,9 +200,22 @@ pub fn extract_metadata_filtered(
     }
 }
 
-pub fn search_pulse_file(path: &Path, pulse: &str, files_only: bool, json: bool) {
-    let filter = |k: &str| is_fusion_key(k);
+pub fn search_pulse_file(
+    path: &Path,
+    pulse: &str,
+    date_filter: &DateFilter,
+    files_only: bool,
+    json: bool,
+) {
+    let filter = |k: &str| is_fusion_key(k) || is_date_key(k);
     if let Ok(entries) = extract_metadata_filtered(path, Some(&filter)) {
+        if date_filter.is_active() {
+            match extract_entry_timestamp(&entries) {
+                Some(ts) if date_filter.matches(ts) => {}
+                _ => return,
+            }
+        }
+
         let matched: Vec<&MetadataEntry> = entries
             .iter()
             .filter(|e| matches_fusion_pulse(&e.key, &e.value, pulse))
@@ -315,18 +357,26 @@ pub fn search_file(
     path: &Path,
     pattern_lower: &str,
     key_filter: Option<&str>,
+    date_filter: &DateFilter,
     keys_only: bool,
     files_only: bool,
     json: bool,
 ) {
     let chunk_filter = key_filter.map(|kf| {
         let kf_string = kf.to_lowercase();
-        move |k: &str| k.to_lowercase().contains(&kf_string)
+        move |k: &str| k.to_lowercase().contains(&kf_string) || is_date_key(k)
     });
 
     let filter_ref = chunk_filter.as_ref().map(|f| f as &dyn Fn(&str) -> bool);
 
     if let Ok(entries) = extract_metadata_filtered(path, filter_ref) {
+        if date_filter.is_active() {
+            match extract_entry_timestamp(&entries) {
+                Some(ts) if date_filter.matches(ts) => {}
+                _ => return,
+            }
+        }
+
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -441,15 +491,28 @@ pub fn search_file(
     }
 }
 
-pub fn list_file(path: &Path, max_lines: usize, key_filter: Option<&str>, json: bool) {
+pub fn list_file(
+    path: &Path,
+    max_lines: usize,
+    key_filter: Option<&str>,
+    date_filter: &DateFilter,
+    json: bool,
+) {
     let chunk_filter = key_filter.map(|kf| {
         let kf_string = kf.to_lowercase();
-        move |k: &str| k.to_lowercase().contains(&kf_string)
+        move |k: &str| k.to_lowercase().contains(&kf_string) || is_date_key(k)
     });
 
     let filter_ref = chunk_filter.as_ref().map(|f| f as &dyn Fn(&str) -> bool);
 
     if let Ok(entries) = extract_metadata_filtered(path, filter_ref) {
+        if date_filter.is_active() {
+            match extract_entry_timestamp(&entries) {
+                Some(ts) if date_filter.matches(ts) => {}
+                _ => return,
+            }
+        }
+
         let filtered: Vec<MetadataEntry> = entries
             .into_iter()
             .filter(|e| {
@@ -503,7 +566,6 @@ pub fn list_file(path: &Path, max_lines: usize, key_filter: Option<&str>, json: 
             return;
         }
 
-        // Terminal Mode
         println!("\x1b[1;35m{}\x1b[0m", path.display());
 
         for entry in filtered {
@@ -618,6 +680,7 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode, custom_excludes: &[String]) {
                             RunMode::Search {
                                 pattern,
                                 key_filter,
+                                date_filter,
                                 keys_only,
                                 files_only,
                                 json,
@@ -625,6 +688,7 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode, custom_excludes: &[String]) {
                                 &path,
                                 pattern,
                                 key_filter.as_deref(),
+                                date_filter,
                                 *keys_only,
                                 *files_only,
                                 *json,
@@ -632,13 +696,15 @@ pub fn visit_dirs(dir: &Path, mode: &RunMode, custom_excludes: &[String]) {
                             RunMode::List {
                                 max_lines,
                                 key_filter,
+                                date_filter,
                                 json,
-                            } => list_file(&path, *max_lines, key_filter.as_deref(), *json),
+                            } => list_file(&path, *max_lines, key_filter.as_deref(), date_filter, *json),
                             RunMode::Pulse {
                                 pulse,
+                                date_filter,
                                 files_only,
                                 json,
-                            } => search_pulse_file(&path, pulse, *files_only, *json),
+                            } => search_pulse_file(&path, pulse, date_filter, *files_only, *json),
                             RunMode::ListModules { json } => list_modules_file(&path, *json),
                         }
                     }
@@ -657,6 +723,7 @@ pub fn process_target(target: &Path, mode: &RunMode, custom_excludes: &[String])
                     RunMode::Search {
                         pattern,
                         key_filter,
+                        date_filter,
                         keys_only,
                         files_only,
                         json,
@@ -665,6 +732,7 @@ pub fn process_target(target: &Path, mode: &RunMode, custom_excludes: &[String])
                             target,
                             pattern,
                             key_filter.as_deref(),
+                            date_filter,
                             *keys_only,
                             *files_only,
                             *json,
@@ -673,16 +741,18 @@ pub fn process_target(target: &Path, mode: &RunMode, custom_excludes: &[String])
                     RunMode::List {
                         max_lines,
                         key_filter,
+                        date_filter,
                         json,
                     } => {
-                        list_file(target, *max_lines, key_filter.as_deref(), *json);
+                        list_file(target, *max_lines, key_filter.as_deref(), date_filter, *json);
                     }
                     RunMode::Pulse {
                         pulse,
+                        date_filter,
                         files_only,
                         json,
                     } => {
-                        search_pulse_file(target, pulse, *files_only, *json);
+                        search_pulse_file(target, pulse, date_filter, *files_only, *json);
                     }
                     RunMode::ListModules { json } => {
                         list_modules_file(target, *json);
