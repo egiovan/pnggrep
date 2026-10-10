@@ -10,14 +10,25 @@ use std::io::BufReader;
 use std::path::Path;
 
 pub const DEFAULT_IGNORED_DIRS: &[&str] = &[
-    "venv", ".venv", "env", ".env", "__pycache__", ".git", ".hg", ".svn",
-    "target", "build", "dist", "node_modules", ".tox", ".pytest_cache",
-    ".mypy_cache", ".cache",
+    "venv", ".venv", "env", ".env", "target", "build", "dist",
+    "node_modules", ".tox", ".pytest_cache", ".mypy_cache",
 ];
 
-/// Directories skipped silently without printing to stderr
+/// Directories skipped silently without printing notices to stderr
 pub const SILENT_IGNORED_DIRS: &[&str] = &[
+    // Version control and bytecode caches
     ".git", "__pycache__", ".hg", ".svn",
+    // Language toolchains & package stores
+    ".julia", ".juliaup",
+    ".rustup", ".cargo",
+    // Remote editor servers & settings
+    ".vscode-server", ".vscode",
+    // Python user caches & notebook environments
+    ".conda", ".cache", ".local", ".ipython", ".jupyter",
+    // JavaScript runtimes & package managers
+    ".npm", ".nvm", ".yarn",
+    // Container runtimes & HPC package managers
+    ".singularity", ".apptainer", ".docker", ".spack",
 ];
 
 #[derive(Clone, Debug)]
@@ -722,6 +733,11 @@ mod tests {
         assert!(is_silent_ignored_dir("__pycache__"));
         assert!(is_silent_ignored_dir(".hg"));
         assert!(is_silent_ignored_dir(".svn"));
+        assert!(is_silent_ignored_dir(".juliaup"));
+        assert!(is_silent_ignored_dir(".rustup"));
+        assert!(is_silent_ignored_dir(".vscode-server"));
+        assert!(is_silent_ignored_dir(".cargo"));
+        assert!(is_silent_ignored_dir(".conda"));
 
         assert!(!is_silent_ignored_dir("venv"));
         assert!(!is_silent_ignored_dir("target"));
@@ -734,8 +750,6 @@ mod tests {
         assert!(is_ignored_dir("venv/"));
         assert!(is_ignored_dir(".venv"));
         assert!(is_ignored_dir("VENV"));
-        assert!(is_ignored_dir("__pycache__"));
-        assert!(is_ignored_dir(".git"));
         assert!(is_ignored_dir("target"));
 
         assert!(!is_ignored_dir("figures"));
