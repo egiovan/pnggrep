@@ -4,8 +4,9 @@ smart_savefig.py - Reproducible Scientific Visualization Module
 Drop-in replacement for `matplotlib.pyplot.savefig`.
 Automatically embeds caller script source code, file system context,
 runtime timestamp, Git commit SHA, Git commit message, execution provenance
-(hostname, username, CLI command), sys.path entries, fusion shot/pulse identifiers,
-local module dependencies, and database schemas into image metadata for PNG, SVG, and PDF.
+(hostname, username, CLI command), automated figure semantics (titles, axis labels, legends),
+sys.path entries, fusion shot/pulse identifiers, local module dependencies,
+and database schemas into image metadata for PNG, SVG, and PDF formats.
 
 Default resolution: 300 DPI.
 
@@ -93,6 +94,11 @@ RESERVED_SYSTEM_KEYS = {
     "user",
     "command",
     "argv",
+    # Automated figure semantics
+    "plottitles",
+    "axislabels",
+    "legendlabels",
+    "figuresemantics",
     # Environment and module hierarchy
     "syspath",
     "localmodules",
@@ -168,6 +174,83 @@ def _get_execution_context() -> dict:
         "username": user,
         "argv": argv,
         "command": command,
+    }
+
+
+def _extract_figure_semantics(fig) -> dict:
+    """
+    Inspect the figure to extract plot titles, axis labels, and legend entries.
+    Deduplicates elements while preserving visual hierarchy.
+    """
+    titles = []
+    labels = []
+    legends = []
+
+    # 1. Figure-level suptitle
+    try:
+        if hasattr(fig, "get_suptitle"):
+            st = fig.get_suptitle()
+            if st and str(st).strip():
+                titles.append(str(st).strip())
+        elif getattr(fig, "_suptitle", None) is not None:
+            st = fig._suptitle.get_text()
+            if st and str(st).strip():
+                titles.append(str(st).strip())
+    except Exception:
+        pass
+
+    # 2. Iterate over all axes (including subplots, twinned axes, colorbars)
+    for ax in getattr(fig, "axes", []):
+        try:
+            # Axis title
+            t = ax.get_title()
+            if t and str(t).strip():
+                titles.append(str(t).strip())
+
+            # Axis labels (x, y, and 3D z if present)
+            for getter in [
+                getattr(ax, "get_xlabel", None),
+                getattr(ax, "get_ylabel", None),
+                getattr(ax, "get_zlabel", None),
+            ]:
+                if getter:
+                    lbl = getter()
+                    if lbl and str(lbl).strip():
+                        labels.append(str(lbl).strip())
+
+            # Explicit legend entries
+            leg = ax.get_legend()
+            if leg:
+                for text_obj in getattr(leg, "get_texts", lambda: [])():
+                    lt = text_obj.get_text()
+                    if lt and str(lt).strip() and not str(lt).startswith("_"):
+                        legends.append(str(lt).strip())
+
+            # Artist trace labels (for lines/collections without explicit legend)
+            for artist_getter in [
+                getattr(ax, "get_lines", lambda: []),
+                getattr(ax, "collections", lambda: []),
+            ]:
+                for item in artist_getter:
+                    lbl = getattr(item, "get_label", lambda: "")()
+                    if lbl and str(lbl).strip() and not str(lbl).startswith("_"):
+                        legends.append(str(lbl).strip())
+        except Exception:
+            continue
+
+    def _dedup(seq):
+        seen = set()
+        out = []
+        for s in seq:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    return {
+        "titles": _dedup(titles),
+        "axis_labels": _dedup(labels),
+        "legends": _dedup(legends),
     }
 
 
@@ -628,7 +711,8 @@ def savefig(
 ):
     """
     Save a Matplotlib figure embedding caller source code, Git metadata,
-    execution provenance, sys.path entries, fusion shot/pulse parameters, and database schemas.
+    execution provenance, automated figure semantics, sys.path entries,
+    fusion shot/pulse parameters, and database schemas.
 
     Parameters:
         fname: Output filename or path (.png, .svg, or .pdf).
@@ -668,7 +752,11 @@ def savefig(
     raw_user_metadata = dict(kwargs.pop("metadata", {}) or {})
     user_metadata = isolate_user_metadata(raw_user_metadata)
 
-    # 1. Process fusion parameters
+    # 1. Automated figure semantics extraction
+    semantics = _extract_figure_semantics(fig)
+    ctx["figure_semantics"] = semantics
+
+    # 2. Process fusion parameters
     fusion_ctx = {}
     if shot is not None:
         fusion_ctx["shot"] = _normalize_int_or_str(shot)
@@ -681,7 +769,7 @@ def savefig(
 
     ctx.update(fusion_ctx)
 
-    # 2. Process database schemas
+    # 3. Process database schemas
     db_schemas = _collect_database_schemas(database, databases)
     if db_schemas:
         ctx["databases"] = db_schemas
@@ -724,6 +812,14 @@ def savefig(
         if ctx["local_modules"]:
             meta["LocalModules"] = ctx["local_modules"]
 
+        # Embed semantics as clean newline-delimited chunks
+        if semantics["titles"]:
+            meta["PlotTitles"] = "\n".join(semantics["titles"])
+        if semantics["axis_labels"]:
+            meta["AxisLabels"] = "\n".join(semantics["axis_labels"])
+        if semantics["legends"]:
+            meta["LegendLabels"] = "\n".join(semantics["legends"])
+
         # Embed fusion keys as standalone PNG chunks
         if "shot" in fusion_ctx:
             meta["Shot"] = str(fusion_ctx["shot"])
@@ -750,8 +846,9 @@ def savefig(
     # 2. SVG Backend (Dublin Core validation)
     # -------------------------------------------------------------------------
     elif ext == ".svg":
+        svg_title = semantics["titles"][0] if semantics["titles"] else ctx["filename"]
         svg_meta = {
-            "Title": ctx["filename"],
+            "Title": svg_title,
             "Date": ctx["timestamp"],
             "Type": "Scientific Visualization",
         }
@@ -779,9 +876,10 @@ def savefig(
     # 3. PDF Backend (PDF /Info dictionary validation)
     # -------------------------------------------------------------------------
     elif ext == ".pdf":
+        pdf_title = semantics["titles"][0] if semantics["titles"] else ctx["filename"]
         native_pdf_meta = {
-            "Title": str(user_metadata.get("Title", ctx["filename"])),
-            "Author": str(user_metadata.get("Author", ctx.get("caller_function", ""))),
+            "Title": str(user_metadata.get("Title", pdf_title)),
+            "Author": str(user_metadata.get("Author", ctx["username"])),
             "Subject": str(user_metadata.get("Subject", f"smart_savefig: {ctx['filename']}")),
             "Creator": f"matplotlib {matplotlib.__version__} (smart_savefig)",
         }
@@ -858,7 +956,7 @@ def read_metadata(image_path: str) -> dict:
         if match:
             raw_val = match.group(1)
             unescaped = (
-                raw_val.replace(b'\\(', b'(') .replace(b'\\)', b')')
+                raw_val.replace(b'\\(', b'(')                 .replace(b'\\)', b')')
                 .replace(b'\\\\', b'\\')
                 .replace(b'\\n', b'\n')
                 .replace(b'\\r', b'\r')
@@ -917,6 +1015,17 @@ if __name__ == "__main__":
         for f_key in ["Shots", "shots", "Pulses", "pulses"]:
             if meta.get(f_key):
                 print(f"# {f_key.capitalize()}:      {meta[f_key]}")
+
+        # Semantics preview
+        titles_val = meta.get("PlotTitles")
+        if titles_val:
+            print(f"# Titles:    {', '.join(titles_val.splitlines())}")
+        labels_val = meta.get("AxisLabels")
+        if labels_val:
+            print(f"# Axis:      {', '.join(labels_val.splitlines())}")
+        legends_val = meta.get("LegendLabels")
+        if legends_val:
+            print(f"# Legends:   {', '.join(legends_val.splitlines())}")
 
         local_mods_raw = meta.get("LocalModules") or meta.get("local_modules", "")
         if local_mods_raw:
